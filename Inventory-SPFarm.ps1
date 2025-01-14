@@ -1,10 +1,13 @@
 <#
 .SYNOPSIS
-    Script to gather details of all lists and libraries in SharePoint site collections and log the process.
+   This script generates a report of all lists and libraries in a SharePoint On-premises Farm, including file counts, 
+   total size, last modified date, and full URL. The output is saved to a CSV file, and a log file is generated 
+   to track the progress and any errors.
 
 .DESCRIPTION
-    This script ensures the SharePoint PowerShell snap-in is loaded, processes each site collection in the SharePoint farm,
-    gathers details of all lists and libraries, and logs the process. The collected data is exported to a CSV file.
+    The script traverses through all site collections in the SharePoint Farm, processes each site and its sub-sites, 
+    and gathers details about all lists and libraries. It handles large lists by retrieving items in batches to avoid 
+    the list view threshold issue. The script also includes error handling and logging mechanisms.
 
 .PARAMETER snapinName
     The name of the PowerShell snap-in to check and load if not already loaded.
@@ -62,12 +65,13 @@
     Executes the script to gather details of all lists and libraries in SharePoint site collections and logs the process.
 
 .NOTES
+Ensure you have the necessary permissions to run SharePoint PowerShell commands and access the SharePoint farm.
 
 Authors: Mike Lee
 Date: 1/14/2025
 
+.DISCLAIMER
 Disclaimer: The sample scripts are provided AS IS without warranty of any kind. 
-
 Microsoft further disclaims all implied warranties including, without limitation, 
 any implied warranties of merchantability or of fitness for a particular purpose. 
 The entire risk arising out of the use or performance of the sample scripts and documentation remains with you. 
@@ -76,9 +80,6 @@ production, or delivery of the scripts be liable for any damages whatsoever
 (including, without limitation, damages for loss of business profits, business interruption, 
 loss of business information, or other pecuniary loss) arising out of the use of or inability 
 to use the sample scripts or documentation, even if Microsoft has been advised of the possibility of such damages.
-
-Ensure you have the necessary permissions to run SharePoint PowerShell commands and access the SharePoint farm.
-
 #>
 
 # Function to check if the PSSnapin is already loaded
