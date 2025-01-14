@@ -164,9 +164,9 @@ function Get-ListDetails {
             }
         }
 
-        # Get items in batches of 5000
+        # Get items in batches of 500
         $totalSizeRef = [ref]$totalSize
-        Get-ListItemsInBatches -list $list -batchSize 5000 -totalSize $totalSizeRef
+        Get-ListItemsInBatches -list $list -batchSize 500 -totalSize $totalSizeRef
 
         # Create a custom object with the list/library details
         [PSCustomObject]@{
