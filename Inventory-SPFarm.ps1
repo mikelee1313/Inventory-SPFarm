@@ -80,8 +80,9 @@ to use the sample scripts or documentation, even if Microsoft has been advised o
 Ensure you have the necessary permissions to run SharePoint PowerShell commands and access the SharePoint farm.
 
 #>
+
 # Function to check if the PSSnapin is already loaded
-function Test-PSSnapinLoaded {
+function Ensure-PSSnapinLoaded {
     param (
         [string]$snapinName
     )
@@ -98,12 +99,12 @@ function Test-PSSnapinLoaded {
 }
 
 # Ensure the SharePoint PowerShell snap-in is loaded
-Test-PSSnapinLoaded -snapinName "Microsoft.SharePoint.PowerShell"
+Ensure-PSSnapinLoaded -snapinName "Microsoft.SharePoint.PowerShell"
 
 # Function to write log messages with timestamps
 function Write-Log {
     param (
-        [string]$message, # The message to log
+        [string]$message,       # The message to log
         [string]$logFilePath    # The path to the log file
     )
 
@@ -118,7 +119,7 @@ function Write-Log {
 # Function to get details of all lists and libraries in a site
 function Get-ListDetails {
     param (
-        [Microsoft.SharePoint.SPWeb]$web, # The SharePoint site (web) to process
+        [Microsoft.SharePoint.SPWeb]$web,  # The SharePoint site (web) to process
         [string]$logFilePath               # The path to the log file
     )
 
@@ -137,37 +138,44 @@ function Get-ListDetails {
         function Get-ListItemsInBatches {
             param (
                 [Microsoft.SharePoint.SPList]$list,
-                [int]$batchSize
+                [int]$batchSize,
+                [ref]$totalSize
             )
 
             $query = New-Object Microsoft.SharePoint.SPQuery
             $query.RowLimit = $batchSize
             $position = $null
 
-            do {
-                $query.ListItemCollectionPosition = $position
-                $items = $list.GetItems($query)
-                $position = $items.ListItemCollectionPosition
+            try {
+                do {
+                    $query.ListItemCollectionPosition = $position
+                    $items = $list.GetItems($query)
+                    $position = $items.ListItemCollectionPosition
 
-                foreach ($item in $items) {
-                    if ($null -ne $item.File) {
-                        $totalSize += $item.File.Length
+                    foreach ($item in $items) {
+                        if ($item.File -ne $null) {
+                            $totalSize.Value += $item.File.Length
+                        }
                     }
-                }
-            } while ($null -ne $position)
+                } while ($position -ne $null)
+            }
+            catch {
+                Write-Log -message "Error retrieving items in batches for list: $($list.Title) - $_" -logFilePath $logFilePath
+            }
         }
 
         # Get items in batches of 5000
-        Get-ListItemsInBatches -list $list -batchSize 5000
+        $totalSizeRef = [ref]$totalSize
+        Get-ListItemsInBatches -list $list -batchSize 5000 -totalSize $totalSizeRef
 
         # Create a custom object with the list/library details
         [PSCustomObject]@{
-            SiteUrl      = $web.Url
-            ListName     = $list.Title
-            ItemCount    = $itemCount
-            TotalSizeMB  = [math]::Round($totalSize / 1MB, 2)
+            SiteUrl = $web.Url
+            ListName = $list.Title
+            ItemCount = $itemCount
+            TotalSizeMB = [math]::Round($totalSize / 1MB, 2)
             LastModified = $lastModified
-            FullUrl      = $list.DefaultViewUrl
+            FullUrl = $list.DefaultViewUrl
         }
     }
 }
@@ -175,7 +183,7 @@ function Get-ListDetails {
 # Function to process each site and its sub-sites
 function Invoke-SiteProcessing {
     param (
-        [Microsoft.SharePoint.SPWeb]$web, # The SharePoint site (web) to process
+        [Microsoft.SharePoint.SPWeb]$web,  # The SharePoint site (web) to process
         [string]$logFilePath               # The path to the log file
     )
 
