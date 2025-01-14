@@ -1,6 +1,6 @@
-This script will collect data from an On-Prem SharePoint farm. 
+This script generates a report of all lists and libraries in a SharePoint On-premises Farm, including file counts, total size, last modified date, and full URL. The output is saved to a CSV file, and a log file is generated to track the progress and any errors.
 
-It gathers details of all lists and libraries including, Site Collection URL, Last Modified date, Item Counts and total capacity. 
+The script traverses through all site collections in the SharePoint Farm, processes each site and its sub-sites, and gathers details about all lists and libraries. It handles large lists by retrieving items in batches to avoid the list view threshold issue. The script also includes error handling and logging mechanisms
 
 The output is logged and exported to a CSV file.
 
