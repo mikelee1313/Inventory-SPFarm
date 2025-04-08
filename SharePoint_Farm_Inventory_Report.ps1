@@ -223,8 +223,8 @@ try {
     
     # Generate a timestamp for the output and log file names 
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss" 
-    $outputFilePath = "$env:TEMP\SharePointReport_$timestamp.csv" 
-    $logFilePath = "$env:TEMP\SharePointScriptLog_$timestamp.txt"
+    $outputFilePath = "$env:TEMP\SharePoint_Farm_Inventory_Report_$timestamp.csv" 
+    $logFilePath = "$env:TEMP\SharePoint_Farm_Inventory_Log_$timestamp.txt"
 
     # Process each site collection 
     foreach ($siteCollection in $allSiteCollections) { 
