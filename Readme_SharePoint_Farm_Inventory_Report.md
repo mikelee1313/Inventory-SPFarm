@@ -1,6 +1,8 @@
 **SharePoint_Farm_Inventory_Report.ps1** Generates a comprehensive report of SharePoint sites, lists, and libraries with owner information.
 
-Example of diagnoctic log:
+Example of diagnostic log:
+
+![image](https://github.com/user-attachments/assets/d06d9db1-b345-42c2-81d9-35238acefb56)
 
 
 Example of output:
