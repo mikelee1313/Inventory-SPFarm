@@ -107,7 +107,7 @@ function Get-ListDetails {
 
                     foreach ($item in $items) {
                         if ($null -ne $item.File) {
-                            $totalSize.Value += [math]::Round($item.File.Length / 1MB, 2)
+                            $totalSize.Value += $item.File.Length
                         }
                     }
                 } while ($null -ne $position)
@@ -131,7 +131,7 @@ function Get-ListDetails {
             SiteUrl      = $web.Url
             ListName     = $list.Title
             ItemCount    = $itemCount
-            TotalSizeMB  = [math]::Round($totalSize.Value, 2)
+            TotalSizeMB  = [math]::Round($totalSize / 1MB, 2)
             LastModified = $lastModified
             FullUrl      = $list.DefaultViewUrl
             SiteTitle    = $owner.SiteTitle 
