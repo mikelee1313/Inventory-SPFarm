@@ -10,7 +10,6 @@ This repository contains PowerShell scripts for inventorying, auditing, and extr
 
 - [Scripts Overview](#scripts-overview)
 - [Prerequisites](#prerequisites)
-- [Usage](#usage)
 - [Disclaimer](#disclaimer)
 - [License](#license)
 
