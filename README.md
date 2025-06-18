@@ -1,5 +1,3 @@
-Thank you for clarifying! Here’s an updated README template for your mikelee1313/Inventory-SPFarm repository, now including SharePoint_Farm_Inventory_Report_WithMembers.ps1. This entry describes the script’s likely purpose based on its name and the pattern of other scripts in your repo. If you want a more precise summary, let me know and I can extract the script header for more details.
-
 ---
 
 # Inventory-SPFarm PowerShell Scripts
@@ -41,5 +39,3 @@ The sample scripts are provided AS IS without warranty of any kind. Use them at 
 MIT License.
 
 ---
-
-If you want a detailed description for SharePoint_Farm_Inventory_Report_WithMembers.ps1, let me know and I’ll extract its script header for you!
