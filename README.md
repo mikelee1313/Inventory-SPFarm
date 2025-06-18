@@ -1,5 +1,3 @@
----
-
 # Inventory-SPFarm PowerShell Scripts
 
 This repository contains PowerShell scripts for inventorying, auditing, and extracting information from an on-premises SharePoint Farm. The scripts help administrators generate detailed reports about lists, libraries, workflows, and more.
@@ -37,5 +35,3 @@ The sample scripts are provided AS IS without warranty of any kind. Use them at 
 ## License
 
 MIT License.
-
----
