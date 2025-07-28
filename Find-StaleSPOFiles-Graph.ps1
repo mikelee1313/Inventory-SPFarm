@@ -84,7 +84,7 @@ $monthsBack = 2  # Number of months to look back from today (finds files NOT mod
 $batchSize = 100  # How many items to process before writing to Excel
 $maxItemsPerSheet = 5000 # Maximum items per sheet in Excel
 $outputFormat = "xlsx"  # Output format: "CSV" or "XLSX"
-$debug = $true  # Enable debug output: $true for detailed debug info, $false for informational only
+$debug = $false  # Enable debug output: $true for detailed debug info, $false for informational only
 
 # =================================================================================================
 # END OF USER CONFIGURATION
