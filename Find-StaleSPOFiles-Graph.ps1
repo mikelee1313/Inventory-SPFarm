@@ -78,7 +78,7 @@ $tenant = "85612ccb-4c28-4a34-88df-a538cc139a51"                # This is your T
 $inputFilePath = 'C:\temp\SPOSiteList.txt' # Path to the input file containing site URLs
 
 # --- Target Date Filter ---
-$monthsBack = 12  # Number of months to look back from today (finds files NOT modified within this timeframe)
+$monthsBack = 2  # Number of months to look back from today (finds files NOT modified within this timeframe)
 
 # --- Script Behavior Settings ---
 $batchSize = 100  # How many items to process before writing to Excel
@@ -578,13 +578,12 @@ function Get-DriveItems {
                     # Check if this is actually a file masquerading as a folder
                     $isActuallyFile = $false
                     if ($item.Name) {
-                        $fileName = $item.Name.ToLower()
-                        # Check for common file extensions that shouldn't be folders
-                        $fileExtensions = @('.docx', '.xlsx', '.pptx', '.pdf', '.txt', '.csv', '.doc', '.xls', '.ppt', '.zip', '.jpg', '.png', '.gif', '.mp4', '.mp3', '.agent')
-                        foreach ($ext in $fileExtensions) {
-                            if ($fileName.EndsWith($ext)) {
-                                $isActuallyFile = $true
-                                break
+                        # Use regex pattern to detect any file with an extension (like *.* in DOS)
+                        # Pattern explanation: \.[a-zA-Z0-9]+$ means "dot followed by one or more alphanumeric characters at end of string"
+                        if ($item.Name -match '\.[a-zA-Z0-9]+$') {
+                            $isActuallyFile = $true
+                            if ($debug) {
+                                Write-Log "DEBUG - Detected file extension in '$($item.Name)', treating as file not folder" "INFO"
                             }
                         }
                     }
@@ -592,7 +591,7 @@ function Get-DriveItems {
                     if ($isActuallyFile) {
                         if ($debug) {
                             Write-Log "DEBUG - Item '$($item.Name)' appears to be a file with incorrect folder flag, skipping recursive processing" "INFO"
-                        }6
+                        }
                     }
                     else {
                         if ($debug) {
@@ -683,13 +682,12 @@ function Get-DriveItemsRecursive {
                     # Check if this is actually a file masquerading as a folder
                     $isActuallyFile = $false
                     if ($childItem.Name) {
-                        $fileName = $childItem.Name.ToLower()
-                        # Check for common file extensions that shouldn't be folders
-                        $fileExtensions = @('.docx', '.xlsx', '.pptx', '.pdf', '.txt', '.csv', '.doc', '.xls', '.ppt', '.zip', '.jpg', '.png', '.gif', '.mp4', '.mp3', '.agent')
-                        foreach ($ext in $fileExtensions) {
-                            if ($fileName.EndsWith($ext)) {
-                                $isActuallyFile = $true
-                                break
+                        # Use regex pattern to detect any file with an extension (like *.* in DOS)
+                        # Pattern explanation: \.[a-zA-Z0-9]+$ means "dot followed by one or more alphanumeric characters at end of string"
+                        if ($childItem.Name -match '\.[a-zA-Z0-9]+$') {
+                            $isActuallyFile = $true
+                            if ($debug) {
+                                Write-Log "DEBUG - Detected file extension in '$($childItem.Name)', treating as file not folder" "INFO"
                             }
                         }
                     }
@@ -782,7 +780,9 @@ $ignoreFolders = @(
     "microsoft.ListSync.Endpoints",
     "Maintenance Log Library",
     "DO_NOT_DELETE_ENTERPRISE_USER_CONTAINER_ENUM_LIST",
-    "appfiles"
+    "appfiles",
+    "MicroFeed",
+    "Preservation Hold Library"
 )
 
 # Function to write batch data to file (CSV or Excel)
