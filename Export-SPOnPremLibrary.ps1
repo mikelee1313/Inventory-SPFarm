@@ -63,7 +63,7 @@
 
 param(
     [string]$SiteUrl = "https://spwfe.contoso.local",
-    [string[]]$LibraryNames = @("List1"),
+    [string[]]$LibraryNames = @("Shared Documents", "wikipages", "List1"),
     [string]$DownloadPath = "C:\ExportedLibrary",
     [string]$Username = "contoso\spfarm",
     [string]$Password = ""
