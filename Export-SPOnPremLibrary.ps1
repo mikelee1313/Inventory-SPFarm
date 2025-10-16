@@ -61,14 +61,12 @@
     https://docs.microsoft.com/en-us/powershell/module/sharepoint-pnp/
 #>
 
-
-
 param(
     [string]$SiteUrl = "https://spwfe.contoso.local",
     [string[]]$LibraryNames = @("List1"),
     [string]$DownloadPath = "C:\ExportedLibrary",
     [string]$Username = "contoso\spfarm",
-    [string]$Password = "LS1setup!"
+    [string]$Password = ""
 )
 
 # Check if SharePointPnPPowerShell2019 module is installed
