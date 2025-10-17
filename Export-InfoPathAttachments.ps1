@@ -159,13 +159,123 @@ $DefaultBasicFileName = 'uploadedImage.jpg'
 # Enable verbose output (shows detailed processing information)
 $EnableVerboseOutput = $true
 
+# Enable logging to file (logs all console output to a file)
+$EnableLogging = $true
+
+# Log file location (if empty, will be created in the same directory as the script)
+$LogFilePath = "C:\xmlfiles\infopath_xml\log\out.log"  # Leave empty for auto-generation or specify like "C:\path\to\logfile.log"
+
 #endregion CONFIGURATION
+
+#region LOGGING FUNCTIONS
+# =====================================================================================
+# Logging functionality to capture console output to file
+# =====================================================================================
+
+function Write-Log {
+  param(
+    [Parameter(Mandatory)]
+    [string]$Message,
+        
+    [Parameter()]
+    [ValidateSet('INFO', 'WARNING', 'ERROR', 'VERBOSE', 'SUCCESS')]
+    [string]$Level = 'INFO',
+        
+    [Parameter()]
+    [string]$LogFile = $script:LogFilePath
+  )
+    
+  if (-not $script:EnableLogging -or [string]::IsNullOrEmpty($LogFile)) {
+    return
+  }
+    
+  $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+  $logEntry = "[$timestamp] [$Level] $Message"
+    
+  try {
+    Add-Content -Path $LogFile -Value $logEntry -Encoding UTF8
+  }
+  catch {
+    # If logging fails, don't break the script
+    Write-Warning "Failed to write to log file: $($_.Exception.Message)"
+  }
+}
+
+function Write-VerboseAndLog {
+  param([string]$Message)
+  Write-Verbose $Message
+  Write-Log -Message $Message -Level 'VERBOSE'
+}
+
+function Write-WarningAndLog {
+  param([string]$Message)
+  Write-Warning $Message
+  Write-Log -Message $Message -Level 'WARNING'
+}
+
+function Write-HostAndLog {
+  param(
+    [string]$Object,
+    [string]$ForegroundColor,
+    [switch]$NoNewline
+  )
+    
+  if ($ForegroundColor) {
+    if ($NoNewline) {
+      Write-Host $Object -ForegroundColor $ForegroundColor -NoNewline
+    }
+    else {
+      Write-Host $Object -ForegroundColor $ForegroundColor
+    }
+  }
+  else {
+    if ($NoNewline) {
+      Write-Host $Object -NoNewline
+    }
+    else {
+      Write-Host $Object
+    }
+  }
+    
+  # Determine log level based on color
+  $logLevel = switch ($ForegroundColor) {
+    'Red' { 'ERROR' }
+    'Yellow' { 'WARNING' }
+    'Green' { 'SUCCESS' }
+    default { 'INFO' }
+  }
+    
+  Write-Log -Message $Object -Level $logLevel
+}
+
+#endregion LOGGING FUNCTIONS
 
 #region SCRIPT INITIALIZATION
 # Initialize error tracking
 $script:erroredFiles = @{}
 $script:processedFiles = 0
 $script:extractedAttachments = 0
+
+# Initialize logging
+$script:EnableLogging = $EnableLogging
+if ($EnableLogging) {
+  if ([string]::IsNullOrEmpty($LogFilePath)) {
+    $scriptPath = $MyInvocation.MyCommand.Path
+    $scriptDir = Split-Path -Parent $scriptPath
+    $scriptBaseName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $script:LogFilePath = Join-Path $scriptDir "$scriptBaseName`_$timestamp.log"
+  }
+  else {
+    $script:LogFilePath = $LogFilePath
+  }
+    
+  # Create log file and write header
+  "InfoPath Attachment Extraction Log - Started at $(Get-Date)" | Out-File -FilePath $script:LogFilePath -Encoding UTF8
+  Write-Log -Message "=== InfoPath Attachment Extraction Started ===" -Level 'INFO'
+  Write-Log -Message "Script: $($MyInvocation.MyCommand.Path)" -Level 'INFO'
+  Write-Log -Message "Log File: $($script:LogFilePath)" -Level 'INFO'
+}
 
 # Set verbose preference based on configuration
 if ($EnableVerboseOutput) {
@@ -190,14 +300,14 @@ else {
 
 # Get list of files to process
 if ($sourceFolder) {
-  Write-Verbose "Processing XML files from folder: $sourceFolder"
+  Write-VerboseAndLog "Processing XML files from folder: $sourceFolder"
   if ($recurseFiles) {
     $FilesToProcess = Get-ChildItem -Path $sourceFolder -Filter "*.xml" -File -Recurse | ForEach-Object { $_.FullName }
   }
   else {
     $FilesToProcess = Get-ChildItem -Path $sourceFolder -Filter "*.xml" -File | ForEach-Object { $_.FullName }
   }
-  Write-Verbose "Found $($FilesToProcess.Count) XML files to process"
+  Write-VerboseAndLog "Found $($FilesToProcess.Count) XML files to process"
 }
 elseif ($PSBoundParameters.ContainsKey('InfoPathForm')) {
   # Use provided individual files
@@ -227,16 +337,16 @@ else {
 # Create output folder if it doesn't exist
 if ($CreateAttachmentsFolderIn -and -not (Test-Path $CreateAttachmentsFolderIn)) {
   New-Item -Path $CreateAttachmentsFolderIn -ItemType Directory -Force | Out-Null
-  Write-Verbose "Created output folder: $CreateAttachmentsFolderIn"
+  Write-VerboseAndLog "Created output folder: $CreateAttachmentsFolderIn"
 }
 
 # Validate configuration
-Write-Verbose "Configuration loaded:"
-Write-Verbose "  Source: $(if($sourceFolder){"Folder: $sourceFolder"}else{"Individual files"})"
-Write-Verbose "  Files to Process: $($FilesToProcess.Count) files"
-Write-Verbose "  Output Folder: $CreateAttachmentsFolderIn"
-Write-Verbose "  Basic File Name: $BasicFileNameToUse"
-Write-Verbose "  Recurse Subdirectories: $recurseFiles"
+Write-VerboseAndLog "Configuration loaded:"
+Write-VerboseAndLog "  Source: $(if($sourceFolder){"Folder: $sourceFolder"}else{"Individual files"})"
+Write-VerboseAndLog "  Files to Process: $($FilesToProcess.Count) files"
+Write-VerboseAndLog "  Output Folder: $CreateAttachmentsFolderIn"
+Write-VerboseAndLog "  Basic File Name: $BasicFileNameToUse"
+Write-VerboseAndLog "  Recurse Subdirectories: $recurseFiles"
 #endregion SCRIPT INITIALIZATION
 
 #region MAIN PROCESSING
@@ -244,28 +354,28 @@ Write-Verbose "  Recurse Subdirectories: $recurseFiles"
 foreach ($formFile in $FilesToProcess) {
   $script:processedFiles++
   
-  Write-Verbose "[$script:processedFiles/$($FilesToProcess.Count)] Processing: $formFile"
+  Write-VerboseAndLog "[$script:processedFiles/$($FilesToProcess.Count)] Processing: $formFile"
   
   # Validate file exists
   if (-not (Test-Path -Path $formFile -PathType Leaf)) {
-    Write-Warning "File not found: $formFile"
+    Write-WarningAndLog "File not found: $formFile"
     continue
   }
   
   $formPath = (Resolve-Path -Path $formFile).Path
   $formName = Split-Path -Leaf -Path $formPath
 
-  Write-Verbose "Checking if $formName is valid XML"
+  Write-VerboseAndLog "Checking if $formName is valid XML"
   try { 
     [xml]$xml = (Get-Content -Path $formPath).Replace("§", "") 
   }
   catch {
-    Write-Warning "$formFile isn't valid XML: $($_.Exception.Message)"
+    Write-WarningAndLog "$formFile isn't valid XML: $($_.Exception.Message)"
     $script:erroredFiles[$formName] = "Invalid XML: $($_.Exception.Message)"
     continue
   }
 
-  Write-Verbose 'Resetting the attachment folder variable'
+  Write-VerboseAndLog 'Resetting the attachment folder variable'
   $attachmentFolder = $null
 
   # Fastest way to get through this file (without using XMLStreamReader) is to filter only text nodes
@@ -295,7 +405,7 @@ foreach ($formFile in $FilesToProcess) {
 
     # Handle attachments *without* an InfoPath attachment header
     if ($bytes[0] -ne 199 -or $bytes[1] -ne 73 -or $bytes[2] -ne 70 -or $bytes[3] -ne 65) {
-      Write-Verbose "[$formName] Found an attachment without an InfoPath header, saving as $BasicFileNameToUse"
+      Write-VerboseAndLog "[$formName] Found an attachment without an InfoPath header, saving as $BasicFileNameToUse"
       $fileName = $BasicFileNameToUse
       $arrFileContentBytes = $bytes
     }
@@ -330,7 +440,7 @@ foreach ($formFile in $FilesToProcess) {
 
     # Clean up filename to get rid of spaces and illegal characters
     $fileName = $fileName.Trim() -replace '[^\p{L}\p{Nd}/(/_/)/./@/,/-]', ''
-    Write-Verbose "[$formName] Attachment $fileName is $([Math]::Round($arrFileContentBytes.Length/1MB,2)) MB"
+    Write-VerboseAndLog "[$formName] Attachment $fileName is $([Math]::Round($arrFileContentBytes.Length/1MB,2)) MB"
 
     # Establish the base file name for the attachment
     $nodeName = $textNode.LocalName
@@ -348,32 +458,33 @@ foreach ($formFile in $FilesToProcess) {
       
       if (-not (Test-Path -Path $attachmentFolder -PathType Container)) {
         New-Item -Path $attachmentFolder -ItemType Directory -Force | Out-Null
-        Write-Verbose "[$formName] Created attachment folder: $attachmentFolder"
+        Write-VerboseAndLog "[$formName] Created attachment folder: $attachmentFolder"
       }
       else {
-        Write-Verbose "[$formName] Using existing attachment folder: $attachmentFolder"
+        Write-VerboseAndLog "[$formName] Using existing attachment folder: $attachmentFolder"
       }
     }
 
-    # Check for existing attachments with the same name
-    Write-Verbose 'Checking for existing attachments with the same name'
-    $attachmentFilter = '{0}*-{1}{2}' -f $nodeName, $fileInfo.BaseName, $fileInfo.Extension
+    # Check for existing attachments with the same name (without the nodeName prefix)
+    Write-VerboseAndLog 'Checking for existing attachments with the same name'
+    $attachmentFilter = '{0}{1}*' -f $fileInfo.BaseName, $fileInfo.Extension
     $existingAttachments = Get-ChildItem -Path $attachmentFolder -Filter $attachmentFilter -ErrorAction SilentlyContinue
 
-    # Generate unique filename if needed
+    # Generate unique filename if needed (without the nodeName prefix)
     $attachmentName = if ($null -ne $existingAttachments -and $existingAttachments.Count -gt 0) {
-      Write-Verbose "[$formName] Found existing attachment(s) with similar name: $fileName"
+      Write-VerboseAndLog "[$formName] Found existing attachment(s) with similar name: $fileName"
       $last = $existingAttachments | Sort-Object -Property Name -Descending | Select-Object -First 1
       
-      $lastNum = $last.Name -replace "^$nodeName-copy(\d+)-.*", '$1'
-      if ([string]::IsNullOrEmpty($lastNum) -or $lastNum -eq $last.Name) { $lastNum = 0 }
+      # Look for copy numbers in existing files like "filename-copy1.ext"
+      $lastNum = $last.BaseName -replace "^.*-copy(\d+)$", '$1'
+      if ([string]::IsNullOrEmpty($lastNum) -or $lastNum -eq $last.BaseName) { $lastNum = 0 }
       $nextNum = [int]$lastNum + 1
-      '{0}-copy{1}-{2}{3}' -f $nodeName, $nextNum, $fileInfo.BaseName, $fileInfo.Extension
+      '{0}-copy{1}{2}' -f $fileInfo.BaseName, $nextNum, $fileInfo.Extension
     }
     else {
-      # If there are no existing files with the same name, use the base name
-      Write-Verbose "[$formName] No existing attachments found with name: $fileName"
-      '{0}-{1}{2}' -f $nodeName, $fileInfo.BaseName, $fileInfo.Extension
+      # If there are no existing files with the same name, use just the filename
+      Write-VerboseAndLog "[$formName] No existing attachments found with name: $fileName"
+      '{0}{1}' -f $fileInfo.BaseName, $fileInfo.Extension
     }
 
     # Combine the directory and the attachment name to get the full path
@@ -383,10 +494,10 @@ foreach ($formFile in $FilesToProcess) {
     try { 
       [File]::WriteAllBytes($attachmentPath, $arrFileContentBytes) 
       $script:extractedAttachments++
-      Write-Verbose "[$formName] Saved attachment: $attachmentName ($([Math]::Round($arrFileContentBytes.Length/1KB,1)) KB)"
+      Write-VerboseAndLog "[$formName] Saved attachment: $attachmentName ($([Math]::Round($arrFileContentBytes.Length/1KB,1)) KB)"
     }
     catch {
-      Write-Warning "Can't save attachment from $formFile to $attachmentPath : $($_.Exception.Message)"
+      Write-WarningAndLog "Can't save attachment from $formFile to $attachmentPath : $($_.Exception.Message)"
       $script:erroredFiles[$formName] = "Failed to save attachment: $($_.Exception.Message)"
       continue
     }
@@ -396,28 +507,37 @@ foreach ($formFile in $FilesToProcess) {
 
 #region RESULTS SUMMARY
 # Display summary of processing results
-Write-Host "`n" -NoNewline
-Write-Host "InfoPath Attachment Extraction Complete" -ForegroundColor Green
-Write-Host "=======================================" -ForegroundColor Green
+Write-HostAndLog "`n" -NoNewline
+Write-HostAndLog "InfoPath Attachment Extraction Complete" -ForegroundColor Green
+Write-HostAndLog "=======================================" -ForegroundColor Green
 
-Write-Host "`nProcessing Summary:" -ForegroundColor Cyan
-Write-Host "  Files Processed: $script:processedFiles" -ForegroundColor White
-Write-Host "  Attachments Extracted: $script:extractedAttachments" -ForegroundColor White
-Write-Host "  Files with Errors: $($script:erroredFiles.Count)" -ForegroundColor $(if ($script:erroredFiles.Count -gt 0) { 'Yellow' }else { 'Green' })
+Write-HostAndLog "`nProcessing Summary:" -ForegroundColor Cyan
+Write-HostAndLog "  Files Processed: $script:processedFiles" -ForegroundColor White
+Write-HostAndLog "  Attachments Extracted: $script:extractedAttachments" -ForegroundColor White
+Write-HostAndLog "  Files with Errors: $($script:erroredFiles.Count)" -ForegroundColor $(if ($script:erroredFiles.Count -gt 0) { 'Yellow' }else { 'Green' })
 
 if ($script:erroredFiles.Count -gt 0) {
-  Write-Host "`nFiles with errors:" -ForegroundColor Yellow
+  Write-HostAndLog "`nFiles with errors:" -ForegroundColor Yellow
   foreach ($file in $script:erroredFiles.Keys) {
-    Write-Host "  - $file : $($script:erroredFiles[$file])" -ForegroundColor Yellow
+    Write-HostAndLog "  - $file : $($script:erroredFiles[$file])" -ForegroundColor Yellow
   }
 }
 
 if ($CreateAttachmentsFolderIn) {
-  Write-Host "`nAttachments saved to: $CreateAttachmentsFolderIn" -ForegroundColor Cyan
+  Write-HostAndLog "`nAttachments saved to: $CreateAttachmentsFolderIn" -ForegroundColor Cyan
 }
 
 if ($script:extractedAttachments -eq 0 -and $script:processedFiles -gt 0) {
-  Write-Host "`nNote: No attachments found in the processed XML files." -ForegroundColor Yellow
-  Write-Host "This could mean the files don't contain embedded attachments or they're in a different format." -ForegroundColor Yellow
+  Write-HostAndLog "`nNote: No attachments found in the processed XML files." -ForegroundColor Yellow
+  Write-HostAndLog "This could mean the files don't contain embedded attachments or they're in a different format." -ForegroundColor Yellow
+}
+
+# Log completion
+if ($script:EnableLogging) {
+  Write-Log -Message "=== InfoPath Attachment Extraction Completed ===" -Level 'SUCCESS'
+  Write-Log -Message "Files Processed: $script:processedFiles" -Level 'INFO'
+  Write-Log -Message "Attachments Extracted: $script:extractedAttachments" -Level 'INFO'
+  Write-Log -Message "Files with Errors: $($script:erroredFiles.Count)" -Level 'INFO'
+  Write-HostAndLog "`nLog file saved to: $script:LogFilePath" -ForegroundColor Magenta
 }
 #endregion RESULTS SUMMARY
