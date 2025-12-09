@@ -56,7 +56,7 @@ foreach ($site in $sites) {
         IBMode                  = ""  # Not available via Get-PnPTenantSite
         IBSegment               = $site.InformationBarrierSegments -join "; "
         HasOrphanedGroup        = "N/A"
-        IsTeamsConnected        = ""  # Not reliably available via Get-PnPTenantSite
+        IsTeamsConnected        = $site.IsTeamsConnected
         IsTeamsChannelConnected = $site.IsTeamsChannelConnected
         TeamsChannelType        = $site.TeamsChannelType
         GroupID                 = $site.GroupId
