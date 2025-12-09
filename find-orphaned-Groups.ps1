@@ -54,7 +54,7 @@ foreach ($site in $sites) {
         URL                     = $site.Url
         Owner                   = $site.Owner
         IBMode                  = ""  # Not available via Get-PnPTenantSite
-        IBSegment               = $site.InformationBarrierSegments -join "; "
+        IBSegment               = $site.InformationSegment -join "; "
         HasOrphanedGroup        = "N/A"
         IsTeamsConnected        = $site.IsTeamsConnected
         IsTeamsChannelConnected = $site.IsTeamsChannelConnected
