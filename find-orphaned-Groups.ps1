@@ -54,7 +54,7 @@ foreach ($site in $sites) {
         URL                     = $site.Url
         Owner                   = $site.Owner
         IBMode                  = $site.InformationBarrierMode
-        IBSegment               = $site.InformationSegment -join "; "
+        IBSegment               = $site.InformationBarrierSegments -join "; "
         HasOrphanedGroup        = "N/A"
         IsTeamsConnected        = $site.IsTeamsConnected
         IsTeamsChannelConnected = $site.IsTeamsChannelConnected
