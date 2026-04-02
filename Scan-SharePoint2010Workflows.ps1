@@ -6,27 +6,29 @@
     This script iterates through all site collections, webs, and lists within a specified SharePoint Web Application.
     It identifies workflows associated with each list, retrieves workflow details such as name, GUID, running instances,
     enabled status, author, creation and modification dates, and the last run timestamp. The results are exported to a CSV file.
-    Any sites that cannot be accessed or cause exceptions are logged separately.
+    Any sites that cannot be accessed or cause exceptions are reported as warnings and skipped.
 
 .PARAMETER webapplication
     The URL of the SharePoint Web Application to scan. Update this variable before running the script.
 
 .PARAMETER path
-    The directory path where the output CSV files (workflow details and blocked sites) will be saved. Update this variable before running the script.
+    The directory path where the output CSV file will be saved. Update this variable before running the script.
 
 .OUTPUTS
-    CSV files containing workflow details and blocked sites:
+    CSV file containing workflow details:
         - workflow_<timestamp>.csv: Contains workflow details and their last run status.
-        - blockedsites_<timestamp>.csv: Contains URLs or error messages of sites that could not be processed.
+    Any sites that cannot be accessed are reported as warnings to the console.
 
 .NOTES
 
 Authors: Mike Lee / Sean Gerlinger 
 Date: 4/2/2025
+Updated: 4/2/2026 - added last run status retrieval and improved error handling. Corrected some variable names and added progress indication.
 
     Requirements:
         - SharePoint PowerShell snap-in (Microsoft.SharePoint.PowerShell) must be available.
-        - Execute the script with appropriate permissions to access SharePoint objects.
+        - Must be run from a SharePoint Management Shell session.
+        - Executing account must be a Farm Administrator or have Full Read on the target web application.
 
     The script excludes site collections matching patterns "sitemaster", "/my", or starting with "app-".
 
@@ -34,9 +36,14 @@ Date: 4/2/2025
     Update the variables $webapplication and $path, then execute the script:
     .\Scan-SharePoint2010Workflows.ps1
 
-    This will generate CSV files with workflow details and blocked sites in the specified directory.
+    This will generate a CSV file with workflow details in the specified directory.
 
 #>
+
+[CmdletBinding()]
+param()
+
+#region Configuration
 
 # Variables that need updating
 
@@ -44,82 +51,60 @@ Date: 4/2/2025
 $webapplication = "http://YOURWEBAPPLICATION/"
 
 # Log file location and name
-$path = "c:\\temp\\"
+$path = "c:\temp\"
 
 # Setup log paths - no changes required
 $dateTime = Get-Date -Format yyyy-MM-dd_HH-mm-ss
-$WorkFlowList = $path + "workflow" + "_" + $dateTime + ".csv"
-$BlockedFileName = $path + "blockedsites" + "_" + $dateTime + ".csv"
+$WorkFlowList = Join-Path $path ("workflow_" + $dateTime + ".csv")
+
+#endregion Configuration
+
+#region Initialization
+
+# Ensure output directory exists
+if (-not (Test-Path -Path $path)) {
+    New-Item -ItemType Directory -Path $path -Force | Out-Null
+    Write-Host "Created output directory: $path" -ForegroundColor Yellow
+}
 
 # Add SharePoint snapin if not already loaded
 if ($null -eq (Get-PSSnapin -Name Microsoft.SharePoint.PowerShell -ErrorAction SilentlyContinue)) {
     Add-PSSnapin Microsoft.SharePoint.PowerShell
 }
 
-Clear-Host
+#endregion Initialization
+
+#region Functions
 
 # Function to look up a workflow's last run status
 function Get-WorkFlowLastRan {
     param (
-        [string]$WorkFlowWeb,
+        [Microsoft.SharePoint.SPWeb]$web,
         [string]$HistoryListName,
-        [string]$WorkFlowGUID        
+        [System.Guid]$WorkFlowGUID        
     )  
-           
-    # Get the SPWeb and SPList objects
-    $site = Get-SPWeb $WorkFlowWeb
-    $web = $site
+
     $list = $web.Lists[$HistoryListName]
 
-    # Fix $WorkflowGUID by adding missing {}
-    $WorkFlowGUID = '{' + $WorkFlowGUID + '}'
-   
-    # Get all items from the list with paging support
-    if ($list.ItemCount -eq 0) {
+    # Guard against missing or empty history list
+    if ($null -eq $list -or $list.ItemCount -eq 0) {
         return $null   
     }
+
+    # Format GUID with braces as required by CAML text comparison
+    $guidFormatted = $WorkFlowGUID.ToString("B")
     
+    # Fetch only the single most recent history entry using OrderBy + RowLimit=1
     $query = New-Object Microsoft.SharePoint.SPQuery
-    $query.Query = "<Where><Eq><FieldRef Name='WorkflowAssociation' /><Value Type='Text'>$WorkFlowGUID</Value></Eq></Where>"
-    $query.RowLimit = 300
+    $query.Query = "<Where><Eq><FieldRef Name='WorkflowAssociation' /><Value Type='Text'>$guidFormatted</Value></Eq></Where><OrderBy><FieldRef Name='Occurred' Ascending='FALSE'/></OrderBy>"
+    $query.RowLimit = 1
     $listItems = $list.GetItems($query)
     
     if ($listItems.Count -eq 0) {
         return $null
     }
-    
-    $results = @()
-   
-    # Loop through each item and find the matching item
-    do {
-        foreach ($item in $listItems) {
-            $RowDetails = @{                            
-                "Last Run" = $item['Occurred']
-            }
-            $results += New-Object PSObject -Property $RowDetails                             
-        }
-        # Get the next batch of items
-        $query.ListItemCollectionPosition = $listItems.ListItemCollectionPosition
-        if ($null -ne $query.ListItemCollectionPosition) {
-            $listItems = $list.GetItems($query)
-        }
-        else {
-            break
-        }
-    } while ($true)
 
-    if ($results.Count -eq 0) {
-        return $null
-    }
-    else {
-        $sortedResults = $results | Sort-Object { $_.'Last Run' } -Descending
-        $newestItem = $sortedResults
-        return $newestItem.'Last Run'
-    }
-   
-    # Dispose SharePoint objects
-    $web.Dispose()
-    $site.Dispose()
+    return $listItems[0]['Occurred']
 }
 
 # Recursive function to iterate through all webs and their subsites
@@ -129,32 +114,36 @@ function Get-AllWebs {
     )
 
     # Process the current web
-    Write-Host "Reading Lists in: " $web.Url -ForegroundColor Magenta
+    Write-Verbose "Reading Lists in: $($web.Url)"
 
     # Look at all the lists in a web
     foreach ($list in $web.Lists) {  
-        if ($list.WorkflowAssociations) {  
+        if ($list.WorkflowAssociations.Count -gt 0) {  
             foreach ($wflowAssociation in $list.WorkflowAssociations) {  
                 # Get the last run status of the workflow
-                $LastRans = Get-WorkFlowLastRan -WorkFlowWeb $web.Url -HistoryListName $wflowAssociation.HistoryListTitle -WorkFlowGUID $wflowAssociation.Id
+                $lastRan = Get-WorkFlowLastRan -web $web -HistoryListName $wflowAssociation.HistoryListTitle -WorkFlowGUID $wflowAssociation.Id
                 # Construct the list URL
                 $ListURL = "$($web.Url)/$($list.Title)"
                 # Collect row details
-                $RowDetails = @{            
-                    "Workflow Name"     = $wflowAssociation.InternalName
-                    "Workflow GUID"     = $wflowAssociation.Id
-                    "RunningInstances"  = $wflowAssociation.RunningInstances
-                    "Is Enabled"        = $wflowAssociation.Enabled  
-                    "List URL"          = $ListURL
-                    "Author"            = (Get-SPUser -Identity $wflowAssociation.Author -Web $web.Url).DisplayName
-                    "Created On"        = $wflowAssociation.Created  
-                    "Modified On"       = $wflowAssociation.Modified  
-                    "Parent Web"        = $web.Url
-                    "History List Name" = $wflowAssociation.HistoryListTitle  
-                    "Last Ran"          = ($LastRans | Sort-Object { $_.'Last Run' } -Descending | Select-Object -First 1)                                                           
-                }  
-                # Add row details to results array
-                [System.Collections.ArrayList]$script:results += New-Object PSObject -Property $RowDetails  
+                $authorDisplayName = try {
+                    (Get-SPUser -Identity $wflowAssociation.Author -Web $web.Url -ErrorAction Stop).DisplayName
+                }
+                catch {
+                    $wflowAssociation.Author
+                }
+                $script:results.Add([PSCustomObject]@{            
+                        "Workflow Name"     = $wflowAssociation.InternalName
+                        "Workflow GUID"     = $wflowAssociation.Id
+                        "RunningInstances"  = $wflowAssociation.RunningInstances
+                        "Is Enabled"        = $wflowAssociation.Enabled  
+                        "List URL"          = $ListURL
+                        "Author"            = $authorDisplayName
+                        "Created On"        = $wflowAssociation.Created  
+                        "Modified On"       = $wflowAssociation.Modified  
+                        "Parent Web"        = $web.Url
+                        "History List Name" = $wflowAssociation.HistoryListTitle  
+                        "Last Ran"          = $lastRan                                                           
+                    }) | Out-Null  
             }            
         }  
     }
@@ -167,37 +156,53 @@ function Get-AllWebs {
     }
 }
 
-# Start of scanning
-$results = @()
+#endregion Functions
+
+#region Main
+[System.Collections.ArrayList]$results = @()
 $WebApp = Get-SPWebApplication $webapplication
 Write-Host "Scanning Web Application:" $WebApp.Name -ForegroundColor Green
-   
+
 # Get All site collections and iterate through
 $SitesColl = $WebApp.Sites
+$siteCount = $SitesColl.Count
+$siteIndex = 0
 
 foreach ($Site in $SitesColl) {
+    $siteIndex++
+    $rootWeb = $null
     try {
 
         # Skip sites that match "sitemaster" or "/my/" or start with "app-"
-        if ($Site.Url -match "sitemaster" -or $Site.Url -match "/my" -or $Site.Url -match "app-*") {
-        
+        if ($Site.Url -match "sitemaster" -or $Site.Url -match "/my" -or $Site.Url -match "app-") {
             continue
         }
 
+        Write-Progress -Activity "Scanning Site Collections" -Status "[$siteIndex/$siteCount] $($Site.Url)" -PercentComplete (($siteIndex / $siteCount) * 100)
+
         # Look in all webs in a site collection recursively using the new function Get-AllWebs
-        Get-AllWebs -web $Site.RootWeb
+        $rootWeb = $Site.RootWeb
+        Get-AllWebs -web $rootWeb
           
     }
     catch {  
-        # Log any exceptions to the blocked sites file
-        $_.Exception.Message | Out-File -FilePath $BlockedFileName -Append
-    } 
+        # Log any exceptions as warnings and continue
+        Write-Warning "Skipped $($Site.Url): $($_.Exception.Message)"
+    }
+    finally {
+        if ($null -ne $rootWeb) { $rootWeb.Dispose() }
+        $Site.Dispose()
+    }
 }
+
+Write-Progress -Activity "Scanning Site Collections" -Completed
 
 # Dump the results in the log file after processing all sites and webs.
 if ($results.Count -gt 0) {
-    [System.Collections.ArrayList]$results | Export-Csv -Path "$WorkFlowList" -NoTypeInformation   
+    $results | Export-Csv -Path "$WorkFlowList" -NoTypeInformation   
 }
 
 Write-Host " === === === === === Completed! === === === === === === == "
-Write-Host "Log files saved to: `n$WorkFlowList`n$BlockedFileName" 
+Write-Host "Log file saved to: `n$WorkFlowList"
+
+#endregion Main 
