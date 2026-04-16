@@ -26,6 +26,7 @@
     File Name      : Get-PreservationHoldLibraryReport.ps1
     Author         : Mike Lee
     Date Created   : 4/14/2026
+    Updated        : 4/16/26 add option to output all files to CSV, or top 100 files per site
 
     The script uses app-only authentication with a certificate thumbprint and Microsoft Graph API. Make sure the app has
     proper permissions in your tenant (Sites.Read.All or Sites.ReadWrite.All is recommended).
