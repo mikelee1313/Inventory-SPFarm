@@ -15,9 +15,12 @@
     A text file containing SharePoint site URLs to scan (path specified in $inputFilePath variable).
 
 .OUTPUTS
-    - CSV format: A CSV file with one row per site (path: $env:TEMP\PreservationHoldLibrary_Report_[timestamp].csv)
-      Plus a summary file: *_Summary.csv
-    - A log file documenting the script's execution (path: $env:TEMP\PreservationHoldLibrary_Report_[timestamp].txt)
+    - Report CSV: One row per site with file count and size totals
+      (path: $env:TEMP\PreservationHoldLibrary_Report_[timestamp].csv)
+    - Files CSV: One row per file, written when $getFiles is "top" or "all"
+      (path: $env:TEMP\PreservationHoldLibrary_Files_[timestamp].csv)
+    - Log file documenting the script's execution
+      (path: $env:TEMP\PreservationHoldLibrary_Report_[timestamp].txt)
 
 .NOTES
     File Name      : Get-PreservationHoldLibraryReport.ps1
@@ -53,6 +56,7 @@ to use the sample scripts or documentation, even if Microsoft has been advised o
     - $debug = $false   # Enable informational output only (default)
 #>
 
+#region User Configuration
 # =================================================================================================
 # USER CONFIGURATION - Update the variables in this section
 # =================================================================================================
@@ -67,11 +71,14 @@ $inputFilePath = 'C:\temp\SPOSiteList.txt' # Path to the input file containing s
 
 # --- Script Behavior Settings ---
 $debug = $false  # Enable debug output: $true for detailed debug info, $false for informational only
+$getFiles = "all"  # File enumeration mode: "none" = skip, "top" = top 100 per site (largest first), "all" = every file per site
 
 # =================================================================================================
 # END OF USER CONFIGURATION
 # =================================================================================================
+#endregion User Configuration
 
+#region Module Prerequisites
 # Check for required modules
 $requiredModules = @('Microsoft.Graph.Authentication', 'Microsoft.Graph.Sites', 'Microsoft.Graph.Files')
 
@@ -109,7 +116,9 @@ foreach ($cmdlet in $requiredCmdlets) {
     }
 }
 Write-Host "All required cmdlets are available." -ForegroundColor Green
+#endregion Module Prerequisites
 
+#region Script Initialization
 # Script Parameters
 Add-Type -AssemblyName System.Web
 $startime = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -120,7 +129,15 @@ $outputFilePath = "$env:TEMP\PreservationHoldLibrary_Report_$startime.csv"
 
 # Initialize results collection (List avoids O(n²) array copy on each += append)
 $global:reportData = [System.Collections.Generic.List[object]]::new()
+$global:topFilesData = [System.Collections.Generic.List[object]]::new()
 
+# Set top files output path (used when $getFiles = $true)
+$topFilesOutputPath = "$env:TEMP\PreservationHoldLibrary_Files_$startime.csv"
+#endregion Script Initialization
+
+#region Helper Functions
+
+#region Function: Write-Log
 # Setup logging
 function Write-Log {
     param (
@@ -143,7 +160,9 @@ function Write-Log {
         }
     }
 }
+#endregion Function: Write-Log
 
+#region Function: Invoke-WithRetry
 # Handle SharePoint Online throttling with exponential backoff
 function Invoke-WithRetry {
     param (
@@ -231,7 +250,9 @@ function Invoke-WithRetry {
     
     return $result
 }
+#endregion Function: Invoke-WithRetry
 
+#region Function: Read-SiteURLs
 # Read site URLs from input file — skips blank lines and comment lines (starting with #)
 function Read-SiteURLs {
     param (
@@ -240,7 +261,9 @@ function Read-SiteURLs {
     $urls = Get-Content -Path $filePath | Where-Object { $_.Trim() -ne '' -and -not $_.TrimStart().StartsWith('#') }
     return $urls
 }
+#endregion Function: Read-SiteURLs
 
+#region Function: Get-SiteIdFromUrl
 # Helper function to get site ID from URL using Graph API
 function Get-SiteIdFromUrl {
     param (
@@ -318,7 +341,9 @@ function Get-SiteIdFromUrl {
         return $null
     }
 }
+#endregion Function: Get-SiteIdFromUrl
 
+#region Function: Get-LibraryDriveId
 # Helper function to get drive ID for a document library
 function Get-LibraryDriveId {
     param (
@@ -380,7 +405,9 @@ function Get-LibraryDriveId {
         return $null
     }
 }
+#endregion Function: Get-LibraryDriveId
 
+#region Function: Connect-GraphAPI
 # Connect to Microsoft Graph
 function Connect-GraphAPI {
     try {
@@ -406,7 +433,9 @@ function Connect-GraphAPI {
         return $false
     }
 }
+#endregion Function: Connect-GraphAPI
 
+#region Function: Write-ReportToFile
 # Function to write report data to file (CSV or Excel)
 function Write-ReportToFile {
     param (
@@ -428,11 +457,46 @@ function Write-ReportToFile {
         throw
     }
 }
+#endregion Function: Write-ReportToFile
 
+#region Function: Get-TopFilesBySize
+# Returns files per site sorted largest first. Pass $Top = [int]::MaxValue to retrieve all files.
+function Get-TopFilesBySize {
+    param (
+        [System.Collections.Generic.List[object]]$Items,
+        [string]$SiteURL,
+        [int]$Top = 100
+    )
+
+    $topFiles = $Items |
+    Where-Object { -not $_.deleted -and $null -eq $_.folder -and $null -ne $_.file } |
+    Sort-Object { if ($null -ne $_.size) { [long]$_.size } else { 0L } } -Descending |
+    Select-Object -First $Top
+
+    $result = [System.Collections.Generic.List[object]]::new()
+    foreach ($f in $topFiles) {
+        $sizeBytes = if ($null -ne $f.size) { [long]$f.size } else { 0L }
+        $result.Add([PSCustomObject]@{
+                SiteURL       = $SiteURL
+                FileName      = $f.name
+                FileSizeBytes = $sizeBytes
+                FileSizeMB    = [Math]::Round($sizeBytes / 1MB, 4)
+            })
+    }
+    return $result
+}
+#endregion Function: Get-TopFilesBySize
+
+#endregion Helper Functions
+
+#region Main Execution
+
+#region Startup and Connect
 # Main script execution
 $script:startTime = Get-Date
 Write-Log "Script started at $($script:startTime)"
 Write-Log "Debug mode: $debug"
+Write-Log "Get top files by size: $getFiles"
 Write-Log "Output format: CSV"
 Write-Log "Targeting library: PreservationHoldLibrary"
 Write-Log "Output will be saved to: $outputFilePath"
@@ -445,7 +509,9 @@ if (-not (Connect-GraphAPI)) {
     Write-Log "Failed to connect to Microsoft Graph. Exiting..." "ERROR"
     exit 1
 }
+#endregion Startup and Connect
 
+#region Process Sites
 foreach ($siteURL in $siteURLs) {
     $siteStartTime = Get-Date
     Write-Log "Starting processing for site: $siteURL" "INFO"
@@ -584,6 +650,14 @@ foreach ($siteURL in $siteURLs) {
         $totalMB = [Math]::Round($totalBytes / 1MB, 2)
         $totalGB = [Math]::Round($totalBytes / 1GB, 4)
 
+        if ($getFiles -ne "none") {
+            $topParam = if ($getFiles -eq "all") { [int]::MaxValue } else { 100 }
+            $siteFiles = Get-TopFilesBySize -Items $allItems -SiteURL $siteURL -Top $topParam
+            foreach ($tf in $siteFiles) { $global:topFilesData.Add($tf) }
+            $fileLabel = if ($getFiles -eq "all") { "all $($siteFiles.Count)" } else { "top $($siteFiles.Count)" }
+            Write-Log "Collected $fileLabel file(s) for $siteURL" "INFO"
+        }
+
         Write-Log "Site: $siteURL | Files: $fileCount | Size: $totalMB MB ($totalGB GB)" "SUCCESS"
 
         $global:reportData.Add([PSCustomObject]@{
@@ -611,36 +685,32 @@ foreach ($siteURL in $siteURLs) {
             })
     }
 }
+#endregion Process Sites
 
+#region Write Results
 # Write report
 Write-ReportToFile -Data $global:reportData -FilePath $outputFilePath
 
-# Append a run-summary sheet / record
-$runSummary = [PSCustomObject]@{
-    'Total Sites Processed'    = $global:reportData.Count
-    'Sites With Library Found' = ($global:reportData | Where-Object { $_.LibraryFound }).Count
-    'Grand Total File Count'   = ($global:reportData | Measure-Object -Property FileCount -Sum).Sum
-    'Grand Total Size (Bytes)' = ($global:reportData | Measure-Object -Property TotalSizeBytes -Sum).Sum
-    'Grand Total Size (MB)'    = [Math]::Round((($global:reportData | Measure-Object -Property TotalSizeBytes -Sum).Sum / 1MB), 2)
-    'Grand Total Size (GB)'    = [Math]::Round((($global:reportData | Measure-Object -Property TotalSizeBytes -Sum).Sum / 1GB), 4)
-    'Processing Start Time'    = $script:startTime
-    'Processing End Time'      = Get-Date
-    'Processing Duration'      = (Get-Date) - $script:startTime
+if ($getFiles -ne "none") {
+    if ($global:topFilesData.Count -gt 0) {
+        try {
+            $global:topFilesData | Export-Csv -Path $topFilesOutputPath -NoTypeInformation -Encoding UTF8
+            Write-Log "Files CSV created: $topFilesOutputPath" "SUCCESS"
+        }
+        catch {
+            Write-Log "Failed to write files report: $($_.Exception.Message)" "ERROR"
+        }
+    }
+    else {
+        Write-Log "No file data collected (getFiles was '$getFiles' but no files were found)." "WARNING"
+    }
 }
+#endregion Write Results
 
-try {
-    $summaryPath = $outputFilePath -replace '\.csv$', '_Summary.csv'
-    $runSummary | Export-Csv -Path $summaryPath -NoTypeInformation -Encoding UTF8
-    Write-Log "Summary CSV created: $summaryPath" "SUCCESS"
-}
-catch {
-    Write-Log "Failed to write summary: $($_.Exception.Message)" "WARNING"
-}
-
+#region Cleanup
 # Final log output
 $totalTime = (Get-Date) - $script:startTime
 Write-Log "Scan completed. Sites processed: $($global:reportData.Count). Total processing time: $totalTime" "SUCCESS"
-Write-Log "Results available in: $outputFilePath" "SUCCESS"
 
 # Disconnect from Microsoft Graph
 try {
@@ -650,17 +720,6 @@ try {
 catch {
     Write-Log "Error disconnecting from Microsoft Graph: $($_.Exception.Message)" "WARNING"
 }
+#endregion Cleanup
 
-# Open the output file
-if (Test-Path $outputFilePath) {
-    Write-Log "CSV file created successfully at: $outputFilePath" "SUCCESS"
-    try {
-        Start-Process $outputFilePath
-    }
-    catch {
-        Write-Log "Could not automatically open the CSV file. Please open manually: $outputFilePath" "INFO"
-    }
-}
-else {
-    Write-Log "ERROR: CSV file was not created. Check the log for errors." "ERROR"
-}
+#endregion Main Execution
