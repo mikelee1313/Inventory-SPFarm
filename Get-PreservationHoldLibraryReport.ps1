@@ -81,7 +81,7 @@ $getFiles = "all"  # File enumeration mode: "none" = skip, "top" = top 100 per s
 
 #region Module Prerequisites
 # Check for required modules
-$requiredModules = @('Microsoft.Graph.Authentication', 'Microsoft.Graph.Sites', 'Microsoft.Graph.Files')
+$requiredModules = @('Microsoft.Graph.Authentication', 'Microsoft.Graph.Sites')
 
 Write-Host "Checking and installing required modules..." -ForegroundColor Cyan
 
