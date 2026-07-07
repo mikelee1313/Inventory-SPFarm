@@ -122,26 +122,61 @@ function Add-ReceiverInventoryRows
     }
 }
 
+function Get-VisibleListsForCurrentWeb
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WebUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string]$LogPath
+    )
+
+    try
+    {
+        return @(
+            Get-PnPList |
+            Where-Object { -not $_.Hidden }
+        )
+    }
+    catch
+    {
+        Add-Content -Path $LogPath -Value ("[{0}] Get-PnPList failed for web {1}. Falling back to Get-PnPWeb/Get-PnPProperty. Error: {2}" -f (Get-Date -Format s), $WebUrl, $_.Exception.Message)
+
+        $web = Get-PnPWeb
+        Get-PnPProperty -ClientObject $web -Property Lists | Out-Null
+
+        return @(
+            $web.Lists |
+            Where-Object { -not $_.Hidden }
+        )
+    }
+}
+
 Connect-PnPOnline -Url $adminUrl @connectionParams
 
-$sites = Get-PnPTenantSite |
-Where-Object { $_.Url -notmatch '-my\.sharepoint\.com(/|$)' }
+$sites = Get-PnPTenantSite | Where-Object { $_.Url -notlike "*-my.sharepoint.com*" -and $_.Template -ne "RedirectSite#0" -and $_.ArchiveStatus -eq "NotArchived" }
 $siteCount = $sites.Count
 $siteIndex = 0
 $totalReceiverCount = 0
 
 Add-Content -Path $logPath -Value ("[{0}] Starting scan across {1} sites" -f (Get-Date -Format s), $siteCount)
+Write-Host ("Starting scan across {0} SharePoint site(s)" -f $siteCount) -ForegroundColor Cyan
 
 foreach ($site in $sites)
 {
     $siteIndex++
-    Write-Progress -Activity "Scanning SharePoint sites for remote event receivers" -Status $site.Url -PercentComplete (($siteIndex / $siteCount) * 100)
+    $sitesRemaining = $siteCount - $siteIndex
+    $progressStatus = "{0} ({1}/{2}) - {3} remaining" -f $site.Url, $siteIndex, $siteCount, $sitesRemaining
+    Write-Progress -Activity "Scanning SharePoint sites for remote event receivers" -Status $progressStatus -PercentComplete (($siteIndex / $siteCount) * 100)
     Add-Content -Path $logPath -Value ("[{0}] Processing site {1} ({2}/{3})" -f (Get-Date -Format s), $site.Url, $siteIndex, $siteCount)
 
     try
     {
+        $currentOperation = 'Connect-PnPOnline to site'
         Connect-PnPOnline -Url $site.Url @connectionParams
         $siteResults = New-Object System.Collections.Generic.List[object]
+        $currentOperation = 'Get-PnPEventReceiver -Scope Site'
         $siteLevelReceivers = Get-AffectedRemoteEventReceivers -EventReceivers (Get-PnPEventReceiver -Scope Site)
 
         if ($siteLevelReceivers.Count -gt 0)
@@ -150,6 +185,7 @@ foreach ($site in $sites)
         }
 
         $webUrls = @($site.Url)
+    $currentOperation = 'Get-PnPSubWeb -Recurse'
         $subWebUrls = @(Get-PnPSubWeb -Recurse | Select-Object -ExpandProperty Url)
 
         if ($subWebUrls.Count -gt 0)
@@ -161,7 +197,9 @@ foreach ($site in $sites)
         {
             try
             {
+                $currentOperation = 'Connect-PnPOnline to web'
                 Connect-PnPOnline -Url $webUrl @connectionParams
+                $currentOperation = 'Get-PnPEventReceiver -Scope Web'
                 $webLevelReceivers = Get-AffectedRemoteEventReceivers -EventReceivers (Get-PnPEventReceiver -Scope Web)
 
                 if ($webLevelReceivers.Count -gt 0)
@@ -169,11 +207,12 @@ foreach ($site in $sites)
                     Add-ReceiverInventoryRows -Results $siteResults -SiteUrl $site.Url -WebUrl $webUrl -Scope 'Web' -ListName '' -Receivers $webLevelReceivers -LogPath $logPath
                 }
 
-                $lists = Get-PnPList |
-                Where-Object { -not $_.Hidden }
+                $currentOperation = 'Get list collection'
+                $lists = Get-VisibleListsForCurrentWeb -WebUrl $webUrl -LogPath $logPath
 
                 foreach ($list in $lists)
                 {
+                    $currentOperation = "Get-PnPEventReceiver -List $($list.Title)"
                     $listLevelReceivers = Get-AffectedRemoteEventReceivers -EventReceivers (Get-PnPEventReceiver -List $list)
 
                     if ($listLevelReceivers.Count -gt 0)
@@ -184,7 +223,7 @@ foreach ($site in $sites)
             }
             catch
             {
-                Add-Content -Path $logPath -Value ("[{0}] Failed to process web {1} in site {2}: {3}" -f (Get-Date -Format s), $webUrl, $site.Url, $_.Exception.Message)
+                Add-Content -Path $logPath -Value ("[{0}] Failed to process web {1} in site {2} during {3}: {4}" -f (Get-Date -Format s), $webUrl, $site.Url, $currentOperation, $_.Exception.Message)
             }
 
         }
@@ -194,17 +233,17 @@ foreach ($site in $sites)
             $siteResults | Export-Csv -Path $csvPath -NoTypeInformation -Append
             $totalReceiverCount += $siteResults.Count
             Add-Content -Path $logPath -Value ("[{0}] Wrote {1} receiver records for site {2} to CSV" -f (Get-Date -Format s), $siteResults.Count, $site.Url)
-            Write-Host ("Completed site {0}: found {1} Remote Event Receiver(s) affected by MC1411726" -f $site.Url, $siteResults.Count) -ForegroundColor Red
+            Write-Host ("Completed site {0}/{1} ({2} remaining): {3} found {4} Remote Event Receiver(s) affected by MC1411726" -f $siteIndex, $siteCount, $sitesRemaining, $site.Url, $siteResults.Count) -ForegroundColor Red
         }
         else
         {
             Add-Content -Path $logPath -Value ("[{0}] No Remote Event Receivers affected by MC1411726 found in site {1}" -f (Get-Date -Format s), $site.Url)
-            Write-Host ("Completed site {0}: found 0 Remote Event Receivers affected by MC1411726" -f $site.Url) -ForegroundColor Green
+            Write-Host ("Completed site {0}/{1} ({2} remaining): {3} found 0 Remote Event Receivers affected by MC1411726" -f $siteIndex, $siteCount, $sitesRemaining, $site.Url) -ForegroundColor Green
         }
     }
     catch
     {
-        Add-Content -Path $logPath -Value ("[{0}] Failed to process site {1}: {2}" -f (Get-Date -Format s), $site.Url, $_.Exception.Message)
+        Add-Content -Path $logPath -Value ("[{0}] Failed to process site {1} during {2}: {3}" -f (Get-Date -Format s), $site.Url, $currentOperation, $_.Exception.Message)
     }
 }
 
