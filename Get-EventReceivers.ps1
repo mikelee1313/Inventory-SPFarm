@@ -4,8 +4,9 @@ Locates SharePoint Remote Event Receivers across the tenant in preparation for M
 
 .DESCRIPTION
 This script connects to SharePoint Online by using app-only certificate authentication,
-enumerates tenant sites, inspects non-hidden lists, and records Remote Event Receivers
-that should be reviewed for the MC1411726 retirement effort.
+enumerates tenant sites, inspects site collection, web, and non-hidden list event
+receivers across each root web and subweb, and records Remote Event Receivers that
+should be reviewed for the MC1411726 retirement effort.
 
 The script excludes personal OneDrive sites and excludes
 Microsoft.SharePoint.Webhooks.SPWebhookItemEventReceiver because webhook receivers are
@@ -17,7 +18,7 @@ Creates two files in the current user's temp folder:
 - A CSV file that contains the receiver inventory.
 
 The CSV includes these columns:
-SiteUrl, ListName, ReceiverName, ReceiverClass, ReceiverAssembly, ReceiverUrl, EventType, Type.
+SiteUrl, WebUrl, Scope, ListName, ReceiverName, ReceiverClass, ReceiverAssembly, ReceiverUrl, EventType, Type.
 
 .NOTES
 The app registration used by this script must be able to enumerate tenant sites and
@@ -34,7 +35,7 @@ Mike Lee
 Date: 7/7/2026
 #>
 
-$appID = "1e892341-f9cd-4c54-82d6-0fc3287954cf"  #This is your Entra App ID
+$appID = "abc64618-283f-47ba-a185-50d935d51d57"  #This is your Entra App ID
 $thumbprint = "B696FDCFE1453F3FBC6031F54DE988DA0ED905A9" #This is certificate thumbprint
 $tenant = "9cfc42cb-51da-4055-87e9-b20a170b6ba3" #This is your Tenant ID
 $adminUrl = "https://m365cpi13246019-admin.sharepoint.com"
@@ -47,6 +48,78 @@ $connectionParams = @{
     Thumbprint    = $thumbprint    # Certificate thumbprint for app-based authentication
     Tenant        = $tenant         # Tenant ID (GUID)
     WarningAction = 'SilentlyContinue' # Suppress PnP warnings that are not errors
+}
+
+function Get-AffectedRemoteEventReceivers
+{
+    param(
+        [AllowNull()]
+        [object[]]$EventReceivers
+    )
+
+    if ($null -eq $EventReceivers)
+    {
+        return @()
+    }
+
+    @(
+        $EventReceivers |
+        Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_.ReceiverUrl) -and
+            $_.ReceiverClass -notlike '*SPWebhook*'
+        }
+    )
+}
+
+function Add-ReceiverInventoryRows
+{
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$Results,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SiteUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string]$WebUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Scope,
+
+        [string]$ListName,
+
+        [Parameter(Mandatory = $true)]
+        [object[]]$Receivers,
+
+        [Parameter(Mandatory = $true)]
+        [string]$LogPath
+    )
+
+    foreach ($receiver in $Receivers)
+    {
+        $Results.Add([pscustomobject]@{
+            SiteUrl          = $SiteUrl
+            WebUrl           = $WebUrl
+            Scope            = $Scope
+            ListName         = $ListName
+            ReceiverName     = $receiver.ReceiverName
+            ReceiverClass    = $receiver.ReceiverClass
+            ReceiverAssembly = $receiver.ReceiverAssembly
+            ReceiverUrl      = $receiver.ReceiverUrl
+            EventType        = $receiver.EventType
+            Type             = $receiver.Type
+        })
+
+        if ($Scope -eq 'List')
+        {
+            Add-Content -Path $LogPath -Value ("[{0}] Found {1} scope receiver {2} on list {3} in web {4}" -f (Get-Date -Format s), $Scope, $receiver.ReceiverName, $ListName, $WebUrl)
+        }
+        else
+        {
+            Add-Content -Path $LogPath -Value ("[{0}] Found {1} scope receiver {2} in web {3}" -f (Get-Date -Format s), $Scope, $receiver.ReceiverName, $WebUrl)
+        }
+    }
 }
 
 Connect-PnPOnline -Url $adminUrl @connectionParams
@@ -69,33 +142,51 @@ foreach ($site in $sites)
     {
         Connect-PnPOnline -Url $site.Url @connectionParams
         $siteResults = New-Object System.Collections.Generic.List[object]
+        $siteLevelReceivers = Get-AffectedRemoteEventReceivers -EventReceivers (Get-PnPEventReceiver -Scope Site)
 
-        $lists = Get-PnPList |
-        Where-Object { -not $_.Hidden }
-
-        foreach ($list in $lists)
+        if ($siteLevelReceivers.Count -gt 0)
         {
-            $remoteReceivers = Get-PnPEventReceiver -List $list |
-            Where-Object {
-                -not [string]::IsNullOrWhiteSpace($_.ReceiverUrl) -and
-                $_.ReceiverClass -ne 'Microsoft.SharePoint.Webhooks.SPWebhookItemEventReceiver'
-            }
+            Add-ReceiverInventoryRows -Results $siteResults -SiteUrl $site.Url -WebUrl $site.Url -Scope 'Site' -ListName '' -Receivers $siteLevelReceivers -LogPath $logPath
+        }
 
-            foreach ($receiver in $remoteReceivers)
+        $webUrls = @($site.Url)
+        $subWebUrls = @(Get-PnPSubWeb -Recurse | Select-Object -ExpandProperty Url)
+
+        if ($subWebUrls.Count -gt 0)
+        {
+            $webUrls += $subWebUrls
+        }
+
+        foreach ($webUrl in $webUrls)
+        {
+            try
             {
-                $siteResults.Add([pscustomobject]@{
-                    SiteUrl          = $site.Url
-                    ListName         = $list.Title
-                    ReceiverName     = $receiver.ReceiverName
-                    ReceiverClass    = $receiver.ReceiverClass
-                    ReceiverAssembly = $receiver.ReceiverAssembly
-                    ReceiverUrl      = $receiver.ReceiverUrl
-                    EventType        = $receiver.EventType
-                    Type             = $receiver.Type
-                })
+                Connect-PnPOnline -Url $webUrl @connectionParams
+                $webLevelReceivers = Get-AffectedRemoteEventReceivers -EventReceivers (Get-PnPEventReceiver -Scope Web)
 
-                Add-Content -Path $logPath -Value ("[{0}] Found receiver {1} on list {2} in site {3}" -f (Get-Date -Format s), $receiver.ReceiverName, $list.Title, $site.Url)
+                if ($webLevelReceivers.Count -gt 0)
+                {
+                    Add-ReceiverInventoryRows -Results $siteResults -SiteUrl $site.Url -WebUrl $webUrl -Scope 'Web' -ListName '' -Receivers $webLevelReceivers -LogPath $logPath
+                }
+
+                $lists = Get-PnPList |
+                Where-Object { -not $_.Hidden }
+
+                foreach ($list in $lists)
+                {
+                    $listLevelReceivers = Get-AffectedRemoteEventReceivers -EventReceivers (Get-PnPEventReceiver -List $list)
+
+                    if ($listLevelReceivers.Count -gt 0)
+                    {
+                        Add-ReceiverInventoryRows -Results $siteResults -SiteUrl $site.Url -WebUrl $webUrl -Scope 'List' -ListName $list.Title -Receivers $listLevelReceivers -LogPath $logPath
+                    }
+                }
             }
+            catch
+            {
+                Add-Content -Path $logPath -Value ("[{0}] Failed to process web {1} in site {2}: {3}" -f (Get-Date -Format s), $webUrl, $site.Url, $_.Exception.Message)
+            }
+
         }
 
         if ($siteResults.Count -gt 0)
