@@ -122,12 +122,12 @@ Write-Progress -Activity "Scanning SharePoint sites for remote event receivers" 
 if ($totalReceiverCount -eq 0)
 {
     Add-Content -Path $logPath -Value ("[{0}] Scan complete. No Remote Event Receivers affected by MC1411726 were found." -f (Get-Date -Format s))
-    Write-Host "No Remote Event Receivers affected by MC1411726 were found."
-    Write-Host ("Remote event receiver log written to {0}" -f $logPath)
+    Write-Host "No Remote Event Receivers affected by MC1411726 were found." -ForegroundColor Green
+    Write-Host ("Remote event receiver log written to {0}" -f $logPath) -ForegroundColor Green
 }
 else
 {
     Add-Content -Path $logPath -Value ("[{0}] Scan complete. Found {1} Remote Event Receivers affected by MC1411726. CSV output written to {2}" -f (Get-Date -Format s), $totalReceiverCount, $csvPath)
-    Write-Host ("Remote event receiver log written to {0}" -f $logPath)
-    Write-Host ("Remote event receiver CSV written to {0}" -f $csvPath)
+    Write-Host ("Remote event receiver log written to {0}" -f $logPath) -ForegroundColor Yellow
+    Write-Host ("Remote event receiver CSV written to {0}" -f $csvPath) -ForegroundColor Yellow
 }
