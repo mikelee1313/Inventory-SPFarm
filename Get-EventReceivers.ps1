@@ -52,7 +52,7 @@ $connectionParams = @{
 Connect-PnPOnline -Url $adminUrl @connectionParams
 
 $sites = Get-PnPTenantSite |
-Where-Object { $_.Url -notmatch '-my\.sharepoint\.com/personal/' }
+Where-Object { $_.Url -notmatch '-my\.sharepoint\.com(/|$)' }
 $siteCount = $sites.Count
 $siteIndex = 0
 $totalReceiverCount = 0
@@ -103,10 +103,12 @@ foreach ($site in $sites)
             $siteResults | Export-Csv -Path $csvPath -NoTypeInformation -Append
             $totalReceiverCount += $siteResults.Count
             Add-Content -Path $logPath -Value ("[{0}] Wrote {1} receiver records for site {2} to CSV" -f (Get-Date -Format s), $siteResults.Count, $site.Url)
+            Write-Host ("Completed site {0}: found {1} Remote Event Receiver(s) affected by MC1411726" -f $site.Url, $siteResults.Count) -ForegroundColor Red
         }
         else
         {
-            Write-Host ("No Remote Event Receivers affected by MC1411726 found in {0}" -f $site.Url)
+            Add-Content -Path $logPath -Value ("[{0}] No Remote Event Receivers affected by MC1411726 found in site {1}" -f (Get-Date -Format s), $site.Url)
+            Write-Host ("Completed site {0}: found 0 Remote Event Receivers affected by MC1411726" -f $site.Url) -ForegroundColor Green
         }
     }
     catch
