@@ -37,8 +37,10 @@
       * ProcessSimple.Environment.Read (Power Automate)
       * Flow.Read (Power Automate flows)
       * PowerApps.ReadAll (Power Apps)
-    - OAuth redirect URI (http://localhost:8080) registered under "Mobile and desktop applications"
-    - Port 8080 must be available when script runs
+        - OAuth redirect URIs registered under "Mobile and desktop applications":
+            * Flows: http://localhost:8081
+            * Apps:  http://localhost:8082
+        - Both ports must be available when script runs
     - User must have access to target Power Automate environments
 
     CONFIGURATION
@@ -46,7 +48,7 @@
     Edit the Configuration section (lines 50-80) to set:
     - $tenantId: Azure AD tenant ID
     - $clientId: Entra ID app registration Client ID
-    - $redirectUri: OAuth callback URI (default: http://localhost:8080)
+    - $redirectUriFlows / $redirectUriApps: OAuth callback URIs for Flows and Apps
     - $OutputFolder: Where to save CSV files (default: $env:TEMP)
     - $MaxRetries, $InitialBackoffSec, $RequestTimeoutSec: Throttle/retry settings
 
@@ -77,14 +79,16 @@
 ##############################################################
 
 # ---- Debug output (set to $true for verbose Graph call tracing) ----
-$debug = $true
+$debug = $false
 
 # ---- Tenant & App Registration ----
 $tenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3'   # Tenant ID or verified domain, e.g. 'contoso.onmicrosoft.com'
 $clientId = 'abc64618-283f-47ba-a185-50d935d51d57'   # Application (client) ID of the Entra ID app registration
 
-# ---- Redirect URI — must match a registered redirect URI on the app registration ----
-$redirectUri = 'http://localhost:8080'
+# ---- Redirect URIs — each must match a registered redirect URI on the app registration ----
+# Use different localhost ports to avoid listener conflicts between Flows and Apps auth.
+$redirectUriFlows = 'http://localhost:8081'
+$redirectUriApps = 'http://localhost:8082'
 
 # ---- OAuth scopes (space-separated) ----
 # Use specific scopes instead of /.default to request only what is needed (least privilege).
@@ -105,6 +109,13 @@ $RequestTimeoutSec = 300   # Per-request timeout in seconds
 
 # ---- Browser sign-in listener timeout (seconds) ----
 $AuthListenerTimeoutSec = 120
+
+# ---- Collection scope: what resources to collect ----
+# Valid values: 'Flows', 'Apps', or 'Both'
+# 'Flows' - collect only Power Automate flows
+# 'Apps' - collect only Power Apps
+# 'Both' - collect both flows and apps (default)
+$collectionScope = 'Both'
 
 ##############################################################
 #                END CONFIGURATION SECTION                   #
@@ -283,7 +294,7 @@ function Get-TokenWithPKCE {
     .SYNOPSIS
         Performs an interactive OAuth 2.0 Authorization Code + PKCE flow to acquire a
         Microsoft Graph access token and refresh token for the signed-in user.
-        Opens the default browser, listens on $redirectUri for the callback, then
+        Opens the default browser, listens on the token-type-specific redirect URI for the callback, then
         exchanges the authorization code for tokens.
         
     .PARAMETER Scope
@@ -296,6 +307,8 @@ function Get-TokenWithPKCE {
         [Parameter()] [string] $Scope = $script:scopeFlows,
         [Parameter()] [ValidateSet('Flows', 'Apps')] [string] $TokenType = 'Flows'
     )
+
+    $redirectUri = if ($TokenType -eq 'Flows') { $script:redirectUriFlows } else { $script:redirectUriApps }
     
     Write-Host "Starting interactive PKCE authentication for $TokenType..." -ForegroundColor Cyan
 
@@ -313,6 +326,7 @@ function Get-TokenWithPKCE {
     "&response_mode=query"
 
     Write-Host "Opening browser for sign-in ($TokenType scope)..." -ForegroundColor Yellow
+    Write-Host "Using redirect URI: $redirectUri" -ForegroundColor DarkGray
     Write-Host "If the browser does not open automatically, navigate to:`n$authUri" -ForegroundColor Cyan
     Start-Process $authUri
 
@@ -520,7 +534,7 @@ function Get-PowerAutomateEnvironments {
         Retrieves all Power Automate environments accessible to the signed-in user.
     #>
     $uri = 'https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments?api-version=2016-11-01'
-    $headers = Get-GraphAuthHeaders
+    $headers = Get-GraphAuthHeaders -TokenType 'Flows'
     $headers['Content-Type'] = 'application/json'
     
     try {
@@ -537,7 +551,7 @@ function Get-PowerAutomateEnvironments {
         if ($errorMsg -like '*401*' -or $errorMsg -like '*Unauthorized*') {
             Write-Host "`n[DIAGNOSTICS]" -ForegroundColor Yellow
             Write-Host "Authentication failed. Possible causes:" -ForegroundColor Yellow
-            Write-Host "1. Scope is incorrect. Current scope: $scope" -ForegroundColor Yellow
+            Write-Host "1. Scope is incorrect. Current scope: $scopeFlows" -ForegroundColor Yellow
             Write-Host "2. App registration does not have Power Automate permissions" -ForegroundColor Yellow
             Write-Host "3. User has not consented to Power Automate access" -ForegroundColor Yellow
             Write-Host "`nTry re-running to trigger fresh authentication." -ForegroundColor Yellow
@@ -546,6 +560,29 @@ function Get-PowerAutomateEnvironments {
             Write-Host "  - Flow.Read" -ForegroundColor Cyan
         }
         
+        return @()
+    }
+}
+
+function Get-PowerAppsEnvironments {
+    <#
+    .SYNOPSIS
+        Retrieves all Power Apps environments accessible to the signed-in user.
+    #>
+    $uri = 'https://api.powerapps.com/providers/Microsoft.PowerApps/environments?api-version=2016-11-01'
+    $headers = Get-GraphAuthHeaders -TokenType 'Apps'
+    $headers['Content-Type'] = 'application/json'
+
+    try {
+        $response = Invoke-GraphRequestWithThrottleHandling `
+            -Uri $uri `
+            -Method 'GET' `
+            -Headers $headers
+        return $response.value
+    }
+    catch {
+        $errorMsg = $_.Exception.Message
+        Write-Warning "Failed to retrieve Power Apps environments: $errorMsg"
         return @()
     }
 }
@@ -565,7 +602,7 @@ function Get-PowerAutomateFlows {
         $uri += "&`$filter=properties/flowType eq '$FlowType'"
     }
     
-    $headers = Get-GraphAuthHeaders
+    $headers = Get-GraphAuthHeaders -TokenType 'Flows'
     $headers['Content-Type'] = 'application/json'
     
     try {
@@ -593,7 +630,7 @@ function Get-PowerAutomateDesktopFlows {
     )
     
     $uri = "https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/$EnvironmentId/flows?api-version=2016-11-01&`$filter=properties/flowType eq 'DesktopFlow'"
-    $headers = Get-GraphAuthHeaders
+    $headers = Get-GraphAuthHeaders -TokenType 'Flows'
     $headers['Content-Type'] = 'application/json'
     
     try {
@@ -683,7 +720,7 @@ function Get-PowerAppDetails {
     
     # Try to get app definition from the app resource
     $uri = "https://api.powerapps.com/providers/Microsoft.PowerApps/apps/$AppId/definition?api-version=2020-10-01"
-    $headers = Get-GraphAuthHeaders
+    $headers = Get-GraphAuthHeaders -TokenType 'Apps'
     $headers['Content-Type'] = 'application/json'
     
     try {
@@ -773,7 +810,7 @@ function Get-FlowDetails {
     }
     
     $uri = "https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/$EnvironmentId/flows/$FlowId`?api-version=2016-11-01"
-    $headers = Get-GraphAuthHeaders
+    $headers = Get-GraphAuthHeaders -TokenType 'Flows'
     $headers['Content-Type'] = 'application/json'
     
     try {
@@ -1045,7 +1082,7 @@ function Get-ConnectorStatus {
     )
     
     $uri = "https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/$EnvironmentId/connectors?api-version=2016-11-01"
-    $headers = Get-GraphAuthHeaders
+    $headers = Get-GraphAuthHeaders -TokenType 'Flows'
     $headers['Content-Type'] = 'application/json'
     
     try {
@@ -1230,8 +1267,24 @@ function Export-PowerAutomateFlowsToCSV {
 ##############################################################
 
 try {
+    # Normalize collection scope for case-insensitive input.
+    $collectionScope = if ($null -ne $collectionScope) { $collectionScope.ToString().Trim() } else { '' }
+    switch ($collectionScope.ToLowerInvariant()) {
+        'flows' { $collectionScope = 'Flows'; break }
+        'apps'  { $collectionScope = 'Apps'; break }
+        'both'  { $collectionScope = 'Both'; break }
+    }
+
+    # Validate collection scope parameter
+    if ($collectionScope -notin @('Flows', 'Apps', 'Both')) {
+        Write-Host "Error: Invalid collection scope '$collectionScope'" -ForegroundColor Red
+        Write-Host "Valid values are: 'Flows', 'Apps', or 'Both'" -ForegroundColor Red
+        exit 1
+    }
+    
     # Clear any cached tokens to force fresh authentication
-    Write-Host "Initializing authentication for Power Automate and Power Apps..." -ForegroundColor Cyan
+    Write-Host "Initializing authentication for Power Automate..." -ForegroundColor Cyan
+    Write-Host "Collection scope: $collectionScope" -ForegroundColor Yellow
     $global:tokenFlows = $null
     $global:tokenFlowsExpiry = $null
     $global:refreshTokenFlows = $null
@@ -1240,18 +1293,21 @@ try {
     $global:refreshTokenApps = $null
     
     # Request token for Power Automate Flows (required)
-    Get-TokenWithPKCE -Scope $scopeFlows -TokenType 'Flows'
-    
-    # Try Power Apps auth (optional) - skip on any error
-    Write-Host "`nAttempting Power Apps authentication (optional)..." -ForegroundColor Yellow
-    try {
-        Get-TokenWithPKCE -Scope $scopeApps -TokenType 'Apps'
-        Write-Host "  Power Apps token acquired successfully." -ForegroundColor Green
+    if ($collectionScope -in @('Flows', 'Both')) {
+        Get-TokenWithPKCE -Scope $scopeFlows -TokenType 'Flows'
     }
-    catch {
-        Write-Host "  ⚠ Power Apps authentication unavailable: $($_.Exception.Message)" -ForegroundColor Yellow
-        Write-Host "  Will attempt to retrieve Power Apps using Power Automate scope instead..." -ForegroundColor Cyan
-        $global:tokenApps = $global:tokenFlows  # Use Flows token as fallback for Power Apps
+    
+    # Try Power Apps auth if needed (optional, gracefully skip on error)
+    if ($collectionScope -in @('Apps', 'Both')) {
+        Write-Host "`nAttempting Power Apps authentication (optional)..." -ForegroundColor Yellow
+        try {
+            Get-TokenWithPKCE -Scope $scopeApps -TokenType 'Apps'
+            Write-Host "  Power Apps token acquired successfully." -ForegroundColor Green
+        }
+        catch {
+            Write-Host "  ⚠ Power Apps authentication unavailable: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "  Continuing without Power Apps (they will not be collected)." -ForegroundColor Cyan
+        }
     }
 
     Write-Host "`n=========================================" -ForegroundColor Cyan
@@ -1265,8 +1321,14 @@ try {
     $allFlowsData = @()
 
     # Get all environments
-    Write-Host "Retrieving Power Automate environments..." -ForegroundColor Yellow
-    $environments = Get-PowerAutomateEnvironments
+    if ($collectionScope -eq 'Apps') {
+        Write-Host "Retrieving Power Apps environments..." -ForegroundColor Yellow
+        $environments = Get-PowerAppsEnvironments
+    }
+    else {
+        Write-Host "Retrieving Power Automate environments..." -ForegroundColor Yellow
+        $environments = Get-PowerAutomateEnvironments
+    }
 
     if ($environments.Count -eq 0) {
         Write-Host "No environments found." -ForegroundColor Yellow
@@ -1285,15 +1347,22 @@ try {
         Write-Host "ID: $envId" -ForegroundColor DarkGray
         Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`n" -ForegroundColor Magenta
 
-        # Get flows in this environment (cloud flows + desktop flows)
-        Write-Host "  Retrieving cloud flows..." -ForegroundColor Yellow
-        $cloudFlows = Get-PowerAutomateFlows -EnvironmentId $envId
+        # Get flows in this environment (cloud flows + desktop flows) based on collection scope
+        $cloudFlows = @()
+        $desktopFlows = @()
+        if ($collectionScope -in @('Flows', 'Both')) {
+            Write-Host "  Retrieving cloud flows..." -ForegroundColor Yellow
+            $cloudFlows = Get-PowerAutomateFlows -EnvironmentId $envId
+            
+            Write-Host "  Retrieving desktop flows..." -ForegroundColor Yellow
+            $desktopFlows = Get-PowerAutomateDesktopFlows -EnvironmentId $envId
+        }
         
-        Write-Host "  Retrieving desktop flows..." -ForegroundColor Yellow
-        $desktopFlows = Get-PowerAutomateDesktopFlows -EnvironmentId $envId
-        
-        Write-Host "  Retrieving Power Apps..." -ForegroundColor Yellow
-        $powerApps = Get-PowerApps -EnvironmentId $envId
+        $powerApps = @()
+        if ($collectionScope -in @('Apps', 'Both')) {
+            Write-Host "  Retrieving Power Apps..." -ForegroundColor Yellow
+            $powerApps = Get-PowerApps -EnvironmentId $envId
+        }
         
         $allFlows = @()
         if ($cloudFlows) { $allFlows += $cloudFlows }
@@ -1315,16 +1384,22 @@ try {
         Write-Host ""
 
         # Get connector status (optional - may not be available in all environments)
-        Write-Host "  Retrieving connector information..." -ForegroundColor Yellow
-        $connectors = Get-ConnectorStatus -EnvironmentId $envId
-        if ($connectors.Count -gt 0) {
-            Write-Host "  Found $($connectors.Count) connector(s)`n" -ForegroundColor Green
+        if ($collectionScope -in @('Flows', 'Both')) {
+            Write-Host "  Retrieving connector information..." -ForegroundColor Yellow
+            $connectors = Get-ConnectorStatus -EnvironmentId $envId
+            if ($connectors.Count -gt 0) {
+                Write-Host "  Found $($connectors.Count) connector(s)`n" -ForegroundColor Green
+            }
+            else {
+                Write-Host "  (Connector details unavailable for this environment)`n" -ForegroundColor DarkGray
+            }
         }
         else {
-            Write-Host "  (Connector details unavailable for this environment)`n" -ForegroundColor DarkGray
+            Write-Host "  Skipping connector status for Apps-only scope.`n" -ForegroundColor DarkGray
         }
 
-        # Process each flow
+        # Process each flow (only if collecting flows)
+        if ($collectionScope -in @('Flows', 'Both')) {
         foreach ($flow in $allFlows) {
             $flowName = $flow.properties.displayName
             $flowId = $flow.name
@@ -1423,8 +1498,10 @@ try {
             Write-Host "    │" -ForegroundColor Cyan
             Write-Host "    └─────────────────────────────────────`n" -ForegroundColor Cyan
         }
+        }
 
-        # Process Power Apps
+        # Process Power Apps (only if collecting apps)
+        if ($collectionScope -in @('Apps', 'Both')) {
         if ($powerApps.Count -gt 0) {
             Write-Host "  Power Apps:" -ForegroundColor Yellow
             foreach ($app in $powerApps) {
@@ -1483,19 +1560,23 @@ try {
                 Write-Host "    └─────────────────────────────────────`n" -ForegroundColor Magenta
             }
         }
+        }
 
         # Collect data for CSV export
         Write-Host "  Collecting data for export..." -ForegroundColor Yellow
         
-        # Collect Power Apps data
-        if ($powerApps.Count -gt 0) {
-            if ($debug) { Write-Host "    [DEBUG-EXPORT] Processing $($powerApps.Count) Power Apps" -ForegroundColor DarkGray }
-            $appsExport = Export-PowerAppsToCSV -Apps $powerApps -EnvironmentName $envName -EnvironmentId $envId
-            $allAppsData += $appsExport
-            if ($debug) { Write-Host "    [DEBUG-EXPORT] Exported $($appsExport.Count) Power App rows" -ForegroundColor DarkGray }
+        # Collect Power Apps data (only if collecting apps)
+        if ($collectionScope -in @('Apps', 'Both')) {
+            if ($powerApps.Count -gt 0) {
+                if ($debug) { Write-Host "    [DEBUG-EXPORT] Processing $($powerApps.Count) Power Apps" -ForegroundColor DarkGray }
+                $appsExport = Export-PowerAppsToCSV -Apps $powerApps -EnvironmentName $envName -EnvironmentId $envId
+                $allAppsData += $appsExport
+                if ($debug) { Write-Host "    [DEBUG-EXPORT] Exported $($appsExport.Count) Power App rows" -ForegroundColor DarkGray }
+            }
         }
         
-        # Collect Power Automate flows data with URLs
+        # Collect Power Automate flows data with URLs (only if collecting flows)
+        if ($collectionScope -in @('Flows', 'Both')) {
         if ($allFlows.Count -gt 0) {
             if ($debug) { Write-Host "    [DEBUG-EXPORT] Processing $($allFlows.Count) flows" -ForegroundColor DarkGray }
             
@@ -1521,6 +1602,7 @@ try {
                 }
             }
         }
+        }
 
         Write-Host "`n" -ForegroundColor Magenta
     }
@@ -1532,7 +1614,8 @@ try {
     
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     
-    # Export Power Apps to separate file
+    # Export Power Apps to separate file (only if collecting apps)
+    if ($collectionScope -in @('Apps', 'Both')) {
     if ($allAppsData.Count -gt 0) {
         $appsOutputPath = Join-Path $OutputFolder "PowerApps_Report_$timestamp.csv"
         $allAppsData | Export-Csv -Path $appsOutputPath -NoTypeInformation -Encoding UTF8 -Force
@@ -1542,8 +1625,10 @@ try {
     else {
         Write-Host "  No Power Apps to export." -ForegroundColor DarkGray
     }
+    }
     
-    # Export Power Automate Flows to separate file
+    # Export Power Automate Flows to separate file (only if collecting flows)
+    if ($collectionScope -in @('Flows', 'Both')) {
     if ($allFlowsData.Count -gt 0) {
         $flowsOutputPath = Join-Path $OutputFolder "PowerAutomate_Flows_Report_$timestamp.csv"
         $allFlowsData | Export-Csv -Path $flowsOutputPath -NoTypeInformation -Encoding UTF8 -Force
@@ -1552,6 +1637,7 @@ try {
     }
     else {
         Write-Host "  No Power Automate flows to export." -ForegroundColor DarkGray
+    }
     }
     
     Write-Host "`nScript completed successfully." -ForegroundColor Green
