@@ -79,7 +79,7 @@
 ##############################################################
 
 # ---- Debug output (set to $true for verbose Graph call tracing) ----
-$debug = $true
+$debug = $false
 
 # ---- Tenant & App Registration ----
 $tenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3'   # Tenant ID or verified domain, e.g. 'contoso.onmicrosoft.com'
@@ -109,6 +109,10 @@ $RequestTimeoutSec = 300   # Per-request timeout in seconds
 
 # ---- Browser sign-in listener timeout (seconds) ----
 $AuthListenerTimeoutSec = 120
+
+# ---- Heartbeat progress output interval ----
+# Prints a progress line every N items while processing flows/apps in an environment.
+$ProgressUpdateEvery = 25
 
 # ---- Collection scope: what resources to collect ----
 # Valid values: 'Flows', 'Apps', or 'Both'
@@ -1305,6 +1309,11 @@ try {
         Write-Host "Valid values are: 'Flows', 'Apps', or 'Both'" -ForegroundColor Red
         exit 1
     }
+
+    if ($ProgressUpdateEvery -lt 1) {
+        Write-Host "ProgressUpdateEvery must be 1 or greater. Using 25." -ForegroundColor Yellow
+        $ProgressUpdateEvery = 25
+    }
     
     # Clear any cached tokens to force fresh authentication
     Write-Host "Initializing authentication for Power Automate..." -ForegroundColor Cyan
@@ -1340,9 +1349,20 @@ try {
     Write-Host "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Cyan
     Write-Host "=========================================`n" -ForegroundColor Cyan
 
-    # Initialize collections for CSV export
-    $allAppsData = @()
-    $allFlowsData = @()
+    # Initialize streaming export targets and running totals.
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $appsOutputPath = if ($collectionScope -in @('Apps', 'Both')) { Join-Path $OutputFolder "PowerApps_Report_$timestamp.csv" } else { $null }
+    $flowsOutputPath = if ($collectionScope -in @('Flows', 'Both')) { Join-Path $OutputFolder "PowerAutomate_Flows_Report_$timestamp.csv" } else { $null }
+    $totalAppsExported = 0
+    $totalFlowsExported = 0
+
+    if ($appsOutputPath) {
+        Write-Host "Power Apps output file: $appsOutputPath" -ForegroundColor DarkGray
+    }
+    if ($flowsOutputPath) {
+        Write-Host "Power Automate flows output file: $flowsOutputPath" -ForegroundColor DarkGray
+    }
+    Write-Host ""
 
     # Get all environments
     if ($collectionScope -eq 'Apps') {
@@ -1365,6 +1385,7 @@ try {
     foreach ($env in $environments) {
         $envName = $env.properties.displayName
         $envId = $env.name
+        $flowUrlMap = @{}
         
         Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Magenta
         Write-Host "ENVIRONMENT: $envName" -ForegroundColor Magenta
@@ -1424,7 +1445,10 @@ try {
 
         # Process each flow (only if collecting flows)
         if ($collectionScope -in @('Flows', 'Both')) {
+        $flowTotal = $allFlows.Count
+        $flowProcessed = 0
         foreach ($flow in $allFlows) {
+            $flowProcessed++
             $flowName = $flow.properties.displayName
             $flowId = $flow.name
             $flowState = $flow.properties.state
@@ -1451,6 +1475,7 @@ try {
                 $allActions = $extracted.AllActions
                 $httpConnectors = $extracted.HttpConnectors
                 $urls = $extracted.Urls
+                $flowUrlMap[$flowId] = $urls
 
                 # Display ALL Actions
                 if ($allActions.Count -gt 0) {
@@ -1521,6 +1546,10 @@ try {
 
             Write-Host "    │" -ForegroundColor Cyan
             Write-Host "    └─────────────────────────────────────`n" -ForegroundColor Cyan
+
+            if (($flowProcessed % $ProgressUpdateEvery -eq 0) -or ($flowProcessed -eq $flowTotal)) {
+                Write-Host "  Progress (Flows): $flowProcessed/$flowTotal processed in '$envName'" -ForegroundColor DarkCyan
+            }
         }
         }
 
@@ -1528,7 +1557,10 @@ try {
         if ($collectionScope -in @('Apps', 'Both')) {
         if ($powerApps.Count -gt 0) {
             Write-Host "  Power Apps:" -ForegroundColor Yellow
+            $appTotal = $powerApps.Count
+            $appProcessed = 0
             foreach ($app in $powerApps) {
+                $appProcessed++
                 # Handle different property names from different API endpoints
                 $appName  = try { $app.displayName } catch { $null }
                 if (-not $appName) { $appName  = try { $app.properties.displayName } catch { $null } }
@@ -1595,6 +1627,10 @@ try {
                 
                 Write-Host "    │" -ForegroundColor Magenta
                 Write-Host "    └─────────────────────────────────────`n" -ForegroundColor Magenta
+
+                if (($appProcessed % $ProgressUpdateEvery -eq 0) -or ($appProcessed -eq $appTotal)) {
+                    Write-Host "  Progress (Apps): $appProcessed/$appTotal processed in '$envName'" -ForegroundColor DarkMagenta
+                }
             }
         }
         }
@@ -1607,7 +1643,15 @@ try {
             if ($powerApps.Count -gt 0) {
                 if ($debug) { Write-Host "    [DEBUG-EXPORT] Processing $($powerApps.Count) Power Apps" -ForegroundColor DarkGray }
                 $appsExport = Export-PowerAppsToCSV -Apps $powerApps -EnvironmentName $envName -EnvironmentId $envId
-                $allAppsData += $appsExport
+                if ($appsExport.Count -gt 0) {
+                    if (Test-Path -Path $appsOutputPath) {
+                        $appsExport | Export-Csv -Path $appsOutputPath -NoTypeInformation -Encoding UTF8 -Append
+                    }
+                    else {
+                        $appsExport | Export-Csv -Path $appsOutputPath -NoTypeInformation -Encoding UTF8
+                    }
+                    $totalAppsExported += $appsExport.Count
+                }
                 if ($debug) { Write-Host "    [DEBUG-EXPORT] Exported $($appsExport.Count) Power App rows" -ForegroundColor DarkGray }
             }
         }
@@ -1616,22 +1660,17 @@ try {
         if ($collectionScope -in @('Flows', 'Both')) {
         if ($allFlows.Count -gt 0) {
             if ($debug) { Write-Host "    [DEBUG-EXPORT] Processing $($allFlows.Count) flows" -ForegroundColor DarkGray }
-            
-            # Build hashtable of flow URLs for export function
-            $flowUrlMap = @{}
-            foreach ($flow in $allFlows) {
-                $flowId = $flow.name
-                if (-not [string]::IsNullOrWhiteSpace($flowId)) {
-                    $flowDef = Get-FlowDetails -EnvironmentId $envId -FlowId $flowId
-                    if ($flowDef) {
-                        $extracted = Extract-HttpConnectorsAndUrls -FlowDefinition $flowDef
-                        $flowUrlMap[$flowId] = $extracted.Urls
-                    }
-                }
-            }
-            
+
             $flowsExport = Export-PowerAutomateFlowsToCSV -Flows $allFlows -EnvironmentName $envName -EnvironmentId $envId -FlowUrls $flowUrlMap
-            $allFlowsData += $flowsExport
+            if ($flowsExport.Count -gt 0) {
+                if (Test-Path -Path $flowsOutputPath) {
+                    $flowsExport | Export-Csv -Path $flowsOutputPath -NoTypeInformation -Encoding UTF8 -Append
+                }
+                else {
+                    $flowsExport | Export-Csv -Path $flowsOutputPath -NoTypeInformation -Encoding UTF8
+                }
+                $totalFlowsExported += $flowsExport.Count
+            }
             if ($debug) { Write-Host "    [DEBUG-EXPORT] Exported $($flowsExport.Count) flow action rows" -ForegroundColor DarkGray }
             if ($debug) { 
                 foreach ($row in $flowsExport | Select-Object -First 3) {
@@ -1641,36 +1680,32 @@ try {
         }
         }
 
+        Write-Host "  Environment complete. Current totals written to disk: Apps=$totalAppsExported, Flows=$totalFlowsExported" -ForegroundColor Green
+
         Write-Host "`n" -ForegroundColor Magenta
     }
 
-    # Export all data to CSV
+    # Final export summary
     Write-Host "`n=========================================" -ForegroundColor Green
-    Write-Host "Exporting to separate CSV files..." -ForegroundColor Yellow
+    Write-Host "Export complete" -ForegroundColor Yellow
     Write-Host "=========================================`n" -ForegroundColor Green
-    
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    
-    # Export Power Apps to separate file (only if collecting apps)
+
+    # Power Apps summary (only if collecting apps)
     if ($collectionScope -in @('Apps', 'Both')) {
-    if ($allAppsData.Count -gt 0) {
-        $appsOutputPath = Join-Path $OutputFolder "PowerApps_Report_$timestamp.csv"
-        $allAppsData | Export-Csv -Path $appsOutputPath -NoTypeInformation -Encoding UTF8 -Force
+    if ($totalAppsExported -gt 0) {
         Write-Host "Power Apps report exported to: $appsOutputPath" -ForegroundColor Green
-        Write-Host "  Total Power Apps exported: $($allAppsData.Count) rows" -ForegroundColor Cyan
+        Write-Host "  Total Power Apps exported: $totalAppsExported rows" -ForegroundColor Cyan
     }
     else {
         Write-Host "  No Power Apps to export." -ForegroundColor DarkGray
     }
     }
     
-    # Export Power Automate Flows to separate file (only if collecting flows)
+    # Power Automate summary (only if collecting flows)
     if ($collectionScope -in @('Flows', 'Both')) {
-    if ($allFlowsData.Count -gt 0) {
-        $flowsOutputPath = Join-Path $OutputFolder "PowerAutomate_Flows_Report_$timestamp.csv"
-        $allFlowsData | Export-Csv -Path $flowsOutputPath -NoTypeInformation -Encoding UTF8 -Force
+    if ($totalFlowsExported -gt 0) {
         Write-Host "Power Automate flows report exported to: $flowsOutputPath" -ForegroundColor Green
-        Write-Host "  Total flow actions exported: $($allFlowsData.Count) rows" -ForegroundColor Cyan
+        Write-Host "  Total flow actions exported: $totalFlowsExported rows" -ForegroundColor Cyan
     }
     else {
         Write-Host "  No Power Automate flows to export." -ForegroundColor DarkGray
