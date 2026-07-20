@@ -49,6 +49,7 @@
     - $tenantId: Azure AD tenant ID
     - $clientId: Entra ID app registration Client ID
     - $redirectUriFlows / $redirectUriApps: OAuth callback URIs for Flows and Apps
+    - $Environment / $ExcludeEnvironment: Optional include/exclude environment filters
     - $OutputFolder: Where to save CSV files (default: $env:TEMP)
     - $MaxRetries, $InitialBackoffSec, $RequestTimeoutSec: Throttle/retry settings
 
@@ -71,6 +72,14 @@
     [Browser opens for interactive sign-in]
     [Script scans environments, retrieves flows/apps, extracts URLs]
     [Two CSV files generated in C:\Users\<user>\AppData\Local\Temp\]
+
+    Set `$Environment = @('Default-Contoso', 'Sandbox')`
+    PS> .\Get-PP-Info.ps1
+    [Only the specified environments are scanned]
+
+    Set `$ExcludeEnvironment = @('Trial', 'Personal Productivity')`
+    PS> .\Get-PP-Info.ps1
+    [All accessible environments except the excluded ones are scanned]
 #>
 
 #region Configuration
@@ -120,6 +129,14 @@ $ProgressUpdateEvery = 25
 # 'Apps' - collect only Power Apps
 # 'Both' - collect both flows and apps (default)
 $collectionScope = 'Both'
+
+# ---- Environment filters ----
+# Match by environment display name or environment ID.
+# Leave empty arrays to scan all accessible environments.
+$Environment = = @()
+$ExcludeEnvironment = @()
+
+
 
 ##############################################################
 #                END CONFIGURATION SECTION                   #
@@ -589,6 +606,58 @@ function Get-PowerAppsEnvironments {
         Write-Warning "Failed to retrieve Power Apps environments: $errorMsg"
         return @()
     }
+}
+
+function Filter-Environments {
+    <#
+    .SYNOPSIS
+        Filters environments by include and exclude lists using display name or environment ID.
+    #>
+    param (
+        [Parameter(Mandatory)] [object[]] $Environments,
+        [Parameter()] [string[]] $IncludeEnvironment,
+        [Parameter()] [string[]] $ExcludeEnvironment
+    )
+
+    $includeLookup = @{}
+    foreach ($value in @($IncludeEnvironment)) {
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $includeLookup[$value.Trim().ToLowerInvariant()] = $true
+        }
+    }
+
+    $excludeLookup = @{}
+    foreach ($value in @($ExcludeEnvironment)) {
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $excludeLookup[$value.Trim().ToLowerInvariant()] = $true
+        }
+    }
+
+    $filteredEnvironments = foreach ($environmentEntry in $Environments) {
+        $environmentId = [string]$environmentEntry.name
+        $environmentName = [string]$environmentEntry.properties.displayName
+        $candidateKeys = @($environmentId, $environmentName) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { $_.Trim().ToLowerInvariant() }
+
+        $isIncluded = ($includeLookup.Count -eq 0)
+        if (-not $isIncluded) {
+            $isIncluded = @($candidateKeys | Where-Object { $includeLookup.ContainsKey($_) }).Count -gt 0
+        }
+
+        if (-not $isIncluded) {
+            continue
+        }
+
+        $isExcluded = @($candidateKeys | Where-Object { $excludeLookup.ContainsKey($_) }).Count -gt 0
+        if ($isExcluded) {
+            continue
+        }
+
+        $environmentEntry
+    }
+
+    return @($filteredEnvironments)
 }
 
 function Get-PowerAutomateFlows {
@@ -1374,12 +1443,29 @@ try {
         $environments = Get-PowerAutomateEnvironments
     }
 
+    $environments = @(Filter-Environments -Environments $environments -IncludeEnvironment $Environment -ExcludeEnvironment $ExcludeEnvironment)
+
     if ($environments.Count -eq 0) {
-        Write-Host "No environments found." -ForegroundColor Yellow
+        if (@($Environment).Count -gt 0 -or @($ExcludeEnvironment).Count -gt 0) {
+            Write-Host "No environments matched the specified include/exclude filters." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "No environments found." -ForegroundColor Yellow
+        }
         exit
     }
 
     Write-Host "Found $($environments.Count) environment(s):`n" -ForegroundColor Green
+
+    if (@($Environment).Count -gt 0) {
+        Write-Host "Environment filter: $($Environment -join ', ')" -ForegroundColor DarkGray
+    }
+    if (@($ExcludeEnvironment).Count -gt 0) {
+        Write-Host "Excluded environments: $($ExcludeEnvironment -join ', ')" -ForegroundColor DarkGray
+    }
+    if (@($Environment).Count -gt 0 -or @($ExcludeEnvironment).Count -gt 0) {
+        Write-Host "" 
+    }
 
     # Process each environment
     foreach ($env in $environments) {
