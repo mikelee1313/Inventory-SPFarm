@@ -1,32 +1,36 @@
 <#
 .SYNOPSIS
-    Comprehensive Power Automate & Power Apps Environment Scanner
-    Scans all Power Automate environments to extract flows, apps, connectors, and URLs.
+        Power Platform Inventory Scanner (Power Automate + Power Apps)
+        Discovers environments, flows, apps, connectors, and extracted endpoint URLs.
 
 .DESCRIPTION
-    Provides complete inventory of Power Automate cloud/desktop flows and Power Apps across
-    all accessible environments using delegated (user) authentication with OAuth 2.0 PKCE flow.
-    Exports comprehensive CSV reports with all available metadata from API responses.
+        Enumerates Power Automate and Power Apps assets across all environments the signed-in
+        user can access. Uses delegated OAuth 2.0 Authorization Code + PKCE and exports
+        detailed CSV reports.
+
+        The script supports modern Power Platform endpoints and automatically falls back to
+        legacy Microsoft.ProcessSimple endpoints when required by tenant/environment behavior.
+        This enables discovery of flows that may not appear on newer endpoints.
 
     FEATURES
     --------
-    - Scans all Power Automate environments accessible to signed-in user
-    - Retrieves cloud flows (automated, instant, scheduled) and desktop flows (RPA)
-    - Retrieves Power Apps (canvas apps) from each environment
-    - Extracts flow definitions to identify HTTP/API connectors and URLs
-    - Parses connectionReferences to identify connector dependencies
-    - Deduplicates flows (API may return same flow multiple times)
-    - Exports two separate CSV files:
-      * PowerApps_Report_[timestamp].csv — 19 columns including description, version, connectors
-      * PowerAutomate_Flows_Report_[timestamp].csv — 16 columns including URLs, connectors, status
+        - Retrieves all accessible environments with include/exclude filtering
+        - Collects cloud flows, desktop flows, and legacy ProcessSimple flows
+        - Collects Power Apps metadata and connector references
+        - Resolves flow details from modern and legacy detail endpoints
+        - Extracts endpoint URLs from flow definitions (including SharePoint dataset URLs when present)
+        - Normalizes flow types to business-friendly labels (for example: Cloud - Automated)
+        - Deduplicates flow entries returned by multiple endpoints
+        - Supports explicit flow URL force-include via `$IncludeFlowUrls`
+        - Produces diagnostic JSON samples when debug dump toggles are enabled
 
     OAUTH AUTHENTICATION
     --------------------
-    Uses a single OAuth 2.0 Authorization Code + PKCE flow for both Flows and Apps:
-    - Scope: https://api.powerplatform.com/.default
+        Uses one OAuth sign-in for both Flows and Apps:
+        - Scope: `https://api.powerplatform.com/.default offline_access`
 
-    A single token is reused across Power Platform endpoints and silently refreshed
-    using refresh tokens; interactive sign-in is only required when refresh token expires.
+        The `offline_access` scope is required so the script can obtain a refresh token,
+        silently refresh access tokens, and exchange for legacy Flow scopes when needed.
 
     PREREQUISITES
     -------------
@@ -35,21 +39,24 @@
       * ProcessSimple.Environment.Read (Power Automate)
       * Flow.Read (Power Automate flows)
       * PowerApps.ReadAll (Power Apps)
-        - OAuth redirect URIs registered under "Mobile and desktop applications":
-            * Flows: http://localhost:8081
-            * Apps:  http://localhost:8082
-        - Both ports must be available when script runs
-    - User must have access to target Power Automate environments
+        - OAuth redirect URI registered under "Mobile and desktop applications":
+            * `http://localhost:8081`
+        - Local machine must be able to open browser auth and receive callback on redirect port
+    - User and APP must have access to target Power Automate environments
 
     CONFIGURATION
-    --------------
-    Edit the Configuration section (lines 50-80) to set:
+        -------------
+        Edit the Configuration section to set:
     - $tenantId: Azure AD tenant ID
     - $clientId: Entra ID app registration Client ID
-    - $redirectUri: OAuth callback URI used for sign-in
-    - $Environment / $ExcludeEnvironment: Optional include/exclude environment filters
+        - $redirectUri: OAuth callback URI
+        - $collectionScope: `Flows`, `Apps`, or `Both`
+        - $Environment / $ExcludeEnvironment: optional environment filters
+        - $IncludeFlowUrls: optional direct flow include list from maker URLs
     - $OutputFolder: Where to save CSV files (default: $env:TEMP)
     - $MaxRetries, $InitialBackoffSec, $RequestTimeoutSec: Throttle/retry settings
+        - $EnableLegacyFlowDiscoveryFallback / $LegacyFlowScopes: legacy discovery behavior
+        - $DumpFlowPayloadSamples / $DumpOneFlowObjectPerEnvironment: debug sample dumps
 
     OUTPUT
     ------
@@ -57,19 +64,26 @@
      1. PowerApps_Report_yyyyMMdd_HHmmss.csv
          Columns: AppName, AppId, Owner, Environment, EnvironmentId, AppType, State, CreatedTime, LastModifiedTime,
                 Description, AppVersion, SharedUsers, SharedGroups, IsFeatured, UsesPremium,
-                UsesCustomConnector, UsesOnPremise, IsCustomizable, BypassConsent, Connectors
+                UsesCustomConnector, UsesOnPremise, IsCustomizable, BypassConsent, AppDetailFetchStatus,
+                Connectors, DatasetUrls
     
     2. PowerAutomate_Flows_Report_yyyyMMdd_HHmmss.csv
          Columns: FlowName, FlowId, FlowType, FlowState, Owner, Environment, EnvironmentId, CreatedTime,
-                LastModifiedTime, TemplateName, ProvisioningMethod, Plan, UserType,
+                LastModifiedTime, TemplateName, ProvisioningMethod, Plan, UserType, OwnerIds,
                 FlowFailureAlert, IsManaged, Connectors, URLs
+
+                 FlowType values are normalized labels, including:
+                 - Cloud - Automated
+                 - Cloud - Instant
+                 - Cloud - Scheduled
+                 - Cloud - Other
+                 - Desktop - RPA
 
     EXAMPLE
     -------
     PS> .\Get-PP-Info.ps1
-    [Browser opens for interactive sign-in]
-    [Script scans environments, retrieves flows/apps, extracts URLs]
-    [Two CSV files generated in C:\Users\<user>\AppData\Local\Temp\]
+        [Interactive sign-in opens in browser]
+        [Script discovers environments, scans flows/apps, and exports CSV files]
 
     Set `$Environment = @('Default-Contoso', 'Sandbox')`
     PS> .\Get-PP-Info.ps1
@@ -78,6 +92,10 @@
     Set `$ExcludeEnvironment = @('Trial', 'Personal Productivity')`
     PS> .\Get-PP-Info.ps1
     [All accessible environments except the excluded ones are scanned]
+
+    Set `$IncludeFlowUrls = @('https://make.powerautomate.com/environments/<envId>/flows/<flowId>/details')`
+    PS> .\Get-PP-Info.ps1
+    [Flow is force-included by direct lookup even if not returned by list endpoints]
 #>
 
 #region Configuration
@@ -158,9 +176,6 @@ $IncludeFlowUrls = @()
 #endregion Configuration
 
 #region Initialization
-$date = Get-Date -Format 'yyyyMMddHHmmss'
-$today = (Get-Date).Date
-
 $global:token = $null
 $global:tokenExpiry = $null
 $global:refreshToken = $null
@@ -725,7 +740,7 @@ function Get-PowerAppsEnvironments {
     return @()
 }
 
-function Filter-Environments {
+function Select-Environments {
     <#
     .SYNOPSIS
         Filters environments by include and exclude lists using display name or environment ID.
@@ -758,8 +773,8 @@ function Filter-Environments {
         $environmentId = [string]$environmentEntry.name
         $environmentName = [string]$environmentEntry.properties.displayName
         $candidateKeys = @($environmentId, $environmentName) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            ForEach-Object { $_.Trim().ToLowerInvariant() }
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { $_.Trim().ToLowerInvariant() }
 
         $isIncluded = ($includeLookup.Count -eq 0)
         if (-not $isIncluded) {
@@ -799,10 +814,10 @@ function Get-FlowTargetsFromUrls {
             $flowId = [uri]::UnescapeDataString($matches[2])
             if (-not [string]::IsNullOrWhiteSpace($envId) -and -not [string]::IsNullOrWhiteSpace($flowId)) {
                 $targets.Add([PSCustomObject]@{
-                    EnvironmentId = $envId
-                    FlowId = $flowId
-                    SourceUrl = $url
-                })
+                        EnvironmentId = $envId
+                        FlowId        = $flowId
+                        SourceUrl     = $url
+                    })
             }
         }
     }
@@ -986,21 +1001,49 @@ function Get-PowerAutomateDesktopFlows {
         "https://api.powerplatform.com/powerautomate/environments/$EnvironmentId/flows?api-version=2024-10-01&flowType=DesktopFlow"
     )
     
+    $desktopFlows = [System.Collections.Generic.List[object]]::new()
+    $seenDesktopFlowKeys = @{}
+
     foreach ($uri in $uris) {
-        try {
-            if ($debug) { Write-Host "    [DEBUG] Fetching desktop flows from: $uri" -ForegroundColor DarkGray }
-            $response = Invoke-GraphRequestWithThrottleHandling `
-                -Uri $uri `
-                -Method 'GET' `
-                -Headers $headers
-            return @($response.value)
-        }
-        catch {
-            if ($debug) { Write-Host "    [DEBUG] Desktop flow endpoint failed: $uri : $($_.Exception.Message)" -ForegroundColor DarkGray }
+        $nextUri = $uri
+
+        while ($nextUri) {
+            try {
+                if ($debug) { Write-Host "    [DEBUG] Fetching desktop flows from: $nextUri" -ForegroundColor DarkGray }
+                $response = Invoke-GraphRequestWithThrottleHandling `
+                    -Uri $nextUri `
+                    -Method 'GET' `
+                    -Headers $headers
+
+                foreach ($flow in @($response.value)) {
+                    $flowKey = try { [string]$flow.workflowId } catch { $null }
+                    if ([string]::IsNullOrWhiteSpace($flowKey)) { $flowKey = try { [string]$flow.name } catch { $null } }
+                    if ([string]::IsNullOrWhiteSpace($flowKey)) { $flowKey = try { [string]$flow.id } catch { $null } }
+                    if ([string]::IsNullOrWhiteSpace($flowKey)) { $flowKey = [guid]::NewGuid().ToString() }
+
+                    if (-not $seenDesktopFlowKeys.ContainsKey($flowKey)) {
+                        $seenDesktopFlowKeys[$flowKey] = $true
+                        $desktopFlows.Add($flow)
+                    }
+                }
+
+                $nextUri = $response.'@odata.nextLink'
+                if (-not $nextUri) {
+                    $nextUri = try { $response.nextLink } catch { $null }
+                }
+
+                if ($nextUri -and $debug) {
+                    Write-Host "    [DEBUG] Fetching next desktop flow page..." -ForegroundColor DarkGray
+                }
+            }
+            catch {
+                if ($debug) { Write-Host "    [DEBUG] Desktop flow endpoint failed: $nextUri : $($_.Exception.Message)" -ForegroundColor DarkGray }
+                $nextUri = $null
+            }
         }
     }
 
-    return @()
+    return @($desktopFlows)
 }
 
 function Get-PowerApps {
@@ -1028,29 +1071,61 @@ function Get-PowerApps {
     $headers = Get-GraphAuthHeaders -TokenType 'Apps'
     $headers['Content-Type'] = 'application/json'
     
+    $apps = [System.Collections.Generic.List[object]]::new()
+    $seenAppKeys = @{}
+
     foreach ($uri in $uris) {
-        try {
-            if ($debug) { Write-Host "    [DEBUG] Trying Power Apps endpoint: $uri" -ForegroundColor DarkGray }
-            $response = Invoke-GraphRequestWithThrottleHandling `
-                -Uri $uri `
-                -Method 'GET' `
-                -Headers $headers
+        $nextUri = $uri
+
+        while ($nextUri) {
+            try {
+                if ($debug) { Write-Host "    [DEBUG] Trying Power Apps endpoint: $nextUri" -ForegroundColor DarkGray }
+                $response = Invoke-GraphRequestWithThrottleHandling `
+                    -Uri $nextUri `
+                    -Method 'GET' `
+                    -Headers $headers
             
             $responseValues = @($response.value)
-            if ($responseValues.Count -gt 0) {
-                if ($debug) { Write-Host "    [DEBUG] Success! Found $($responseValues.Count) Power Apps" -ForegroundColor Green }
-                return $responseValues
+                foreach ($app in $responseValues) {
+                    $appKey = try { [string]$app.appId } catch { $null }
+                    if ([string]::IsNullOrWhiteSpace($appKey)) { $appKey = try { [string]$app.properties.appId } catch { $null } }
+                    if ([string]::IsNullOrWhiteSpace($appKey)) { $appKey = try { [string]$app.name } catch { $null } }
+                    if ([string]::IsNullOrWhiteSpace($appKey)) { $appKey = try { [string]$app.id } catch { $null } }
+                    if ([string]::IsNullOrWhiteSpace($appKey)) { $appKey = [guid]::NewGuid().ToString() }
+
+                    if (-not $seenAppKeys.ContainsKey($appKey)) {
+                        $seenAppKeys[$appKey] = $true
+                        $apps.Add($app)
+                    }
+                }
+
+                $nextUri = $response.'@odata.nextLink'
+                if (-not $nextUri) {
+                    $nextUri = try { $response.nextLink } catch { $null }
+                }
+
+                if ($nextUri -and $debug) {
+                    Write-Host "    [DEBUG] Fetching next Power Apps page..." -ForegroundColor DarkGray
+                }
             }
-        }
-        catch {
-            if ($debug) { Write-Host "    [DEBUG] Endpoint failed: $($_.Exception.Message)" -ForegroundColor DarkGray }
-            continue
+            catch {
+                if ($debug) { Write-Host "    [DEBUG] Endpoint failed: $($_.Exception.Message)" -ForegroundColor DarkGray }
+                $nextUri = $null
+                continue
+            }
         }
     }
     
-    # If all endpoints fail, return empty
-    if ($debug) { Write-Host "    [DEBUG] No Power Apps endpoints returned data" -ForegroundColor Yellow }
-    return @()
+    if ($debug) {
+        if ($apps.Count -gt 0) {
+            Write-Host "    [DEBUG] Success! Found $($apps.Count) Power Apps" -ForegroundColor Green
+        }
+        else {
+            Write-Host "    [DEBUG] No Power Apps endpoints returned data" -ForegroundColor Yellow
+        }
+    }
+
+    return @($apps)
 }
 
 function Get-PowerAppDetails {
@@ -1063,26 +1138,48 @@ function Get-PowerAppDetails {
         [Parameter(Mandatory)] [string] $EnvironmentId
     )
     
-    # Try to get app definition from the app resource
-    $uri = "https://api.powerapps.com/providers/Microsoft.PowerApps/apps/$AppId/definition?api-version=2020-10-01"
+    # Try multiple app definition endpoints for cross-tenant compatibility.
+    $uris = @(
+        "https://api.powerplatform.com/powerapps/environments/$EnvironmentId/apps/$AppId/definition?api-version=2024-10-01",
+        "https://api.powerapps.com/providers/Microsoft.PowerApps/environments/$EnvironmentId/apps/$AppId/definition?api-version=2016-11-01",
+        "https://api.powerapps.com/providers/Microsoft.PowerApps/apps/$AppId/definition?api-version=2022-11-01",
+        "https://api.powerapps.com/providers/Microsoft.PowerApps/apps/$AppId/definition?api-version=2020-10-01"
+    )
+
     $headers = Get-GraphAuthHeaders -TokenType 'Apps'
     $headers['Content-Type'] = 'application/json'
-    
-    try {
-        if ($debug) { Write-Host "    [DEBUG] Fetching app details from: $uri" -ForegroundColor DarkGray }
-        $response = Invoke-GraphRequestWithThrottleHandling `
-            -Uri $uri `
-            -Method 'GET' `
-            -Headers $headers
-        return $response
+
+    foreach ($uri in $uris) {
+        try {
+            if ($debug) { Write-Host "    [DEBUG] Fetching app details from: $uri" -ForegroundColor DarkGray }
+            $response = Invoke-GraphRequestWithThrottleHandling `
+                -Uri $uri `
+                -Method 'GET' `
+                -Headers $headers
+
+            return [PSCustomObject]@{
+                Success  = $true
+                Status   = 'Success'
+                Endpoint = $uri
+                Error    = ''
+                Definition = $response
+            }
+        }
+        catch {
+            if ($debug) { Write-Host "    [DEBUG] Could not retrieve app definition from endpoint: $uri : $($_.Exception.Message)" -ForegroundColor DarkGray }
+        }
     }
-    catch {
-        if ($debug) { Write-Host "    [DEBUG] Could not retrieve app definition: $($_.Exception.Message)" -ForegroundColor DarkGray }
-        return $null
+
+    return [PSCustomObject]@{
+        Success  = $false
+        Status   = 'DefinitionUnavailable'
+        Endpoint = ''
+        Error    = 'All app definition endpoints failed'
+        Definition = $null
     }
 }
 
-function Extract-AppConnectors {
+function Get-AppConnectorsFromDefinition {
     <#
     .SYNOPSIS
         Parses Power App definition to extract connector references.
@@ -1120,21 +1217,21 @@ function Extract-AppConnectors {
             # Look for connection info
             if ($dsValue.connectionReferenceLogicalName) {
                 $connectors += @{
-                    Name = $dsName
-                    Type = 'DataSource'
+                    Name          = $dsName
+                    Type          = 'DataSource'
                     ConnectionRef = $dsValue.connectionReferenceLogicalName
                 }
             }
             
             # Extract URLs if present
-            $extractedUrls = Extract-UrlFromObject -Object $dsValue
+            $extractedUrls = Get-UrlsFromObject -Object $dsValue
             $urls += $extractedUrls
         }
     }
     
     return @{
         Connectors = $connectors | Select-Object -Unique
-        Urls = $urls | Select-Object -Unique
+        Urls       = $urls | Select-Object -Unique
     }
 }
 
@@ -1382,8 +1479,8 @@ function Get-EmbeddedFlowConnectionReferences {
                 $apiId = try { [string]$refValue.api.id } catch { '' }
                 $references += [PSCustomObject]@{
                     ReferenceName = [string]$refProp.Name
-                    ApiName = $apiName
-                    ApiId = $apiId
+                    ApiName       = $apiName
+                    ApiId         = $apiId
                 }
             }
         }
@@ -1497,7 +1594,7 @@ function Resolve-FlowType {
     return 'Unknown'
 }
 
-function Extract-UrlFromObject {
+function Get-UrlsFromObject {
     <#
     .SYNOPSIS
         Recursively searches for URL-like values in an object.
@@ -1523,7 +1620,7 @@ function Extract-UrlFromObject {
     # Handle collections
     if ($Object -is [array]) {
         foreach ($item in $Object) {
-            $urls += Extract-UrlFromObject -Object $item -Depth ($Depth + 1) -MaxDepth $MaxDepth
+            $urls += Get-UrlsFromObject -Object $item -Depth ($Depth + 1) -MaxDepth $MaxDepth
         }
         return $urls
     }
@@ -1532,7 +1629,8 @@ function Extract-UrlFromObject {
     if ($Object -is [PSCustomObject] -or $Object -is [hashtable]) {
         $properties = if ($Object -is [PSCustomObject]) { 
             $Object.PSObject.Properties 
-        } else { 
+        }
+        else { 
             $Object.GetEnumerator() 
         }
         
@@ -1568,7 +1666,7 @@ function Extract-UrlFromObject {
             
             # Recursively search nested objects (max depth 10 to avoid infinite recursion)
             if ($value -is [PSCustomObject] -or $value -is [hashtable] -or $value -is [array]) {
-                $urls += Extract-UrlFromObject -Object $value -Depth ($Depth + 1) -MaxDepth $MaxDepth
+                $urls += Get-UrlsFromObject -Object $value -Depth ($Depth + 1) -MaxDepth $MaxDepth
             }
         }
     }
@@ -1576,7 +1674,7 @@ function Extract-UrlFromObject {
     return $urls | Select-Object -Unique
 }
 
-function Extract-HttpConnectorsAndUrls {
+function Get-HttpConnectorsAndUrlsFromFlow {
     <#
     .SYNOPSIS
         Parses a flow definition to extract ALL actions and HTTP/API connector references with URLs being called.
@@ -1612,17 +1710,17 @@ function Extract-HttpConnectorsAndUrls {
             
             # Collect all trigger details
             $triggerDetails = @{
-                Name = $triggerName
-                Type = 'Trigger'
-                Kind = $triggerObj.type
+                Name          = $triggerName
+                Type          = 'Trigger'
+                Kind          = $triggerObj.type
                 ConnectorName = if ($triggerConnName) { $triggerConnName } else { 'N/A' }
-                Uri = ''
+                Uri           = ''
             }
             
             # Extract URL from trigger
             $triggerInputs = try { $triggerObj.inputs } catch { $null }
             $extractedUrls = if ($null -ne $triggerInputs) {
-                Extract-UrlFromObject -Object $triggerInputs
+                Get-UrlsFromObject -Object $triggerInputs
             }
             else {
                 @()
@@ -1641,11 +1739,11 @@ function Extract-HttpConnectorsAndUrls {
             
             # Check if it's HTTP-related or API connection
             $isApiCall = ($triggerObj.type -eq 'Http' -or 
-                         $triggerObj.type -eq 'HttpWebhook' -or 
-                         $triggerObj.type -eq 'OpenApiConnection' -or
-                         $triggerConnName -like '*http*' -or
-                         $triggerConnName -like '*sharepoint*' -or
-                         $triggerConnName -like '*office365*')
+                $triggerObj.type -eq 'HttpWebhook' -or 
+                $triggerObj.type -eq 'OpenApiConnection' -or
+                $triggerConnName -like '*http*' -or
+                $triggerConnName -like '*sharepoint*' -or
+                $triggerConnName -like '*office365*')
             
             if ($isApiCall) {
                 $httpConnectors += $triggerDetails
@@ -1666,16 +1764,17 @@ function Extract-HttpConnectorsAndUrls {
             
             # Collect all action details
             $actionDetails = @{
-                Name = $actionName
-                Type = 'Action'
-                Kind = $actionObj.type
+                Name          = $actionName
+                Type          = 'Action'
+                Kind          = $actionObj.type
                 ConnectorName = if ($actionConnName) { 
                     $actionConnName 
-                } else { 
+                }
+                else { 
                     'Built-in' 
                 }
-                Uri = ''
-                Method = ''
+                Uri           = ''
+                Method        = ''
             }
             
             # Add method if present (for HTTP actions)
@@ -1687,7 +1786,7 @@ function Extract-HttpConnectorsAndUrls {
             # Extract URLs from action
             $actionInputs = try { $actionObj.inputs } catch { $null }
             $extractedUrls = if ($null -ne $actionInputs) {
-                Extract-UrlFromObject -Object $actionInputs
+                Get-UrlsFromObject -Object $actionInputs
             }
             else {
                 @()
@@ -1717,12 +1816,12 @@ function Extract-HttpConnectorsAndUrls {
             
             # Check if it's HTTP-related or API connection
             $isApiCall = ($actionObj.type -eq 'Http' -or 
-                         $actionObj.type -eq 'HttpWebhook' -or
-                         $actionObj.type -eq 'OpenApiConnection' -or
-                         $actionConnName -like '*http*' -or
-                         $actionConnName -like '*sharepoint*' -or
-                         $actionConnName -like '*office365*' -or
-                         $actionConnKind -like '*http*')
+                $actionObj.type -eq 'HttpWebhook' -or
+                $actionObj.type -eq 'OpenApiConnection' -or
+                $actionConnName -like '*http*' -or
+                $actionConnName -like '*sharepoint*' -or
+                $actionConnName -like '*office365*' -or
+                $actionConnKind -like '*http*')
             
             if ($isApiCall) {
                 $httpConnectors += $actionDetails
@@ -1750,9 +1849,9 @@ function Extract-HttpConnectorsAndUrls {
     if ($debug) { Write-Host "      [DEBUG-EXTRACT] Extracted $($allActions.Count) actions, $($urls.Count) URLs" -ForegroundColor DarkGray }
     
     return @{
-        AllActions = $allActions
+        AllActions     = $allActions
         HttpConnectors = $httpConnectors
-        Urls = $urls | Select-Object -Unique
+        Urls           = $urls | Select-Object -Unique
     }
 }
 
@@ -1809,33 +1908,33 @@ function Export-PowerAppsToCSV {
     
     foreach ($app in $Apps) {
         # Extract all available properties from the app object
-        $appName  = try { $app.displayName } catch { $null }
-        if (-not $appName) { $appName  = try { $app.properties.displayName } catch { $null } }
-        if (-not $appName) { $appName  = try { $app.name } catch { $null } }
-        if (-not $appName) { $appName  = '' }
+        $appName = try { $app.displayName } catch { $null }
+        if (-not $appName) { $appName = try { $app.properties.displayName } catch { $null } }
+        if (-not $appName) { $appName = try { $app.name } catch { $null } }
+        if (-not $appName) { $appName = '' }
 
-        $appId    = try { $app.appId } catch { $null }
-        if (-not $appId)   { $appId    = try { $app.properties.appId } catch { $null } }
-        if (-not $appId)   { $appId    = try { $app.name } catch { $null } }
-        if (-not $appId)   { $appId    = try { $app.id } catch { $null } }
-        if (-not $appId)   { $appId    = '' }
+        $appId = try { $app.appId } catch { $null }
+        if (-not $appId) { $appId = try { $app.properties.appId } catch { $null } }
+        if (-not $appId) { $appId = try { $app.name } catch { $null } }
+        if (-not $appId) { $appId = try { $app.id } catch { $null } }
+        if (-not $appId) { $appId = '' }
 
-        $owner    = try { $app.owner.displayName } catch { $null }
-        if (-not $owner)   { $owner    = try { $app.properties.owner.displayName } catch { $null } }
-        if (-not $owner)   { $owner    = 'Unknown' }
+        $owner = try { $app.owner.displayName } catch { $null }
+        if (-not $owner) { $owner = try { $app.properties.owner.displayName } catch { $null } }
+        if (-not $owner) { $owner = 'Unknown' }
 
-        $appType  = try { $app.appType } catch { $null }
-        if (-not $appType)  { $appType  = try { $app.properties.appType } catch { $null } }
-        if (-not $appType)  { $appType  = 'Unknown' }
+        $appType = try { $app.appType } catch { $null }
+        if (-not $appType) { $appType = try { $app.properties.appType } catch { $null } }
+        if (-not $appType) { $appType = 'Unknown' }
 
         $appState = try { $app.state } catch { $null }
         if (-not $appState) { $appState = try { $app.properties.state } catch { $null } }
         if (-not $appState) { $appState = try { $app.properties.status } catch { $null } }
         if (-not $appState) { $appState = 'Unknown' }
 
-        $createdTime      = try { $app.properties.createdTime } catch { $null }
-        if (-not $createdTime)      { $createdTime      = try { $app.createdTime } catch { $null } }
-        if (-not $createdTime)      { $createdTime      = '' }
+        $createdTime = try { $app.properties.createdTime } catch { $null }
+        if (-not $createdTime) { $createdTime = try { $app.createdTime } catch { $null } }
+        if (-not $createdTime) { $createdTime = '' }
 
         $lastModifiedTime = try { $app.properties.lastModifiedTime } catch { $null }
         if (-not $lastModifiedTime) { $lastModifiedTime = try { $app.lastModifiedTime } catch { $null } }
@@ -1845,16 +1944,16 @@ function Export-PowerAppsToCSV {
         if ([string]::IsNullOrWhiteSpace($appId)) { continue }
         
         # Extract additional properties from app.properties
-        $description           = try { $app.properties.description } catch { $null };           if (-not $description)           { $description           = '' }
-        $appVersion            = try { $app.properties.appVersion } catch { $null };            if (-not $appVersion)            { $appVersion            = '' }
-        $sharedUsersCount      = try { $app.properties.sharedUsersCount } catch { $null };      if ($null -eq $sharedUsersCount) { $sharedUsersCount      = '0' }
-        $sharedGroupsCount     = try { $app.properties.sharedGroupsCount } catch { $null };     if ($null -eq $sharedGroupsCount){ $sharedGroupsCount     = '0' }
-        $isFeaturedApp         = try { $app.properties.isFeaturedApp } catch { $null };         if ($null -eq $isFeaturedApp)    { $isFeaturedApp         = 'False' }
-        $usesPremiumApi        = try { $app.properties.usesPremiumApi } catch { $null };        if ($null -eq $usesPremiumApi)   { $usesPremiumApi        = 'False' }
-        $usesCustomApi         = try { $app.properties.usesCustomApi } catch { $null };         if ($null -eq $usesCustomApi)    { $usesCustomApi         = 'False' }
-        $usesOnPremiseGateway  = try { $app.properties.usesOnPremiseGateway } catch { $null };  if ($null -eq $usesOnPremiseGateway) { $usesOnPremiseGateway = 'False' }
-        $isCustomizable        = try { $app.properties.isCustomizable } catch { $null };        if ($null -eq $isCustomizable)   { $isCustomizable        = 'False' }
-        $bypassConsent         = try { $app.properties.bypassConsent } catch { $null };         if ($null -eq $bypassConsent)    { $bypassConsent         = 'False' }
+        $description = try { $app.properties.description } catch { $null }; if (-not $description) { $description = '' }
+        $appVersion = try { $app.properties.appVersion } catch { $null }; if (-not $appVersion) { $appVersion = '' }
+        $sharedUsersCount = try { $app.properties.sharedUsersCount } catch { $null }; if ($null -eq $sharedUsersCount) { $sharedUsersCount = '0' }
+        $sharedGroupsCount = try { $app.properties.sharedGroupsCount } catch { $null }; if ($null -eq $sharedGroupsCount) { $sharedGroupsCount = '0' }
+        $isFeaturedApp = try { $app.properties.isFeaturedApp } catch { $null }; if ($null -eq $isFeaturedApp) { $isFeaturedApp = 'False' }
+        $usesPremiumApi = try { $app.properties.usesPremiumApi } catch { $null }; if ($null -eq $usesPremiumApi) { $usesPremiumApi = 'False' }
+        $usesCustomApi = try { $app.properties.usesCustomApi } catch { $null }; if ($null -eq $usesCustomApi) { $usesCustomApi = 'False' }
+        $usesOnPremiseGateway = try { $app.properties.usesOnPremiseGateway } catch { $null }; if ($null -eq $usesOnPremiseGateway) { $usesOnPremiseGateway = 'False' }
+        $isCustomizable = try { $app.properties.isCustomizable } catch { $null }; if ($null -eq $isCustomizable) { $isCustomizable = 'False' }
+        $bypassConsent = try { $app.properties.bypassConsent } catch { $null }; if ($null -eq $bypassConsent) { $bypassConsent = 'False' }
         
         # Extract connection references (connectors used)
         $connectors = @()
@@ -1866,7 +1965,7 @@ function Export-PowerAppsToCSV {
         # Extract dataset URLs from connectionReferences.*.dataSets where URLs are often object keys.
         $datasetUrls = @()
         if ($app.properties.connectionReferences) {
-            $datasetUrls = @(Extract-UrlFromObject -Object $app.properties.connectionReferences)
+            $datasetUrls = @(Get-UrlsFromObject -Object $app.properties.connectionReferences)
         }
         $datasetUrlList = if ($datasetUrls.Count -gt 0) {
             @($datasetUrls | Where-Object { $_ -is [string] -and $_ -match '^https?://' } | Select-Object -Unique) -join '; '
@@ -1875,29 +1974,33 @@ function Export-PowerAppsToCSV {
             ''
         }
         
+        $appDetailFetchStatus = try { [string]$app.PSObject.Properties['__AppDetailFetchStatus'].Value } catch { $null }
+        if ([string]::IsNullOrWhiteSpace($appDetailFetchStatus)) { $appDetailFetchStatus = 'NotAttempted' }
+
         # Build CSV row with ALL meaningful fields from API response
         $csvRows += [PSCustomObject]@{
-            'AppName' = $appName
-            'AppId' = $appId
-            'Owner' = $owner
-            'Environment' = $EnvironmentName
-            'EnvironmentId' = $EnvironmentId
-            'AppType' = $appType
-            'State' = $appState
-            'CreatedTime' = $createdTime
-            'LastModifiedTime' = $lastModifiedTime
-            'Description' = $description
-            'AppVersion' = $appVersion
-            'SharedUsers' = $sharedUsersCount
-            'SharedGroups' = $sharedGroupsCount
-            'IsFeatured' = $isFeaturedApp
-            'UsesPremium' = $usesPremiumApi
+            'AppName'             = $appName
+            'AppId'               = $appId
+            'Owner'               = $owner
+            'Environment'         = $EnvironmentName
+            'EnvironmentId'       = $EnvironmentId
+            'AppType'             = $appType
+            'State'               = $appState
+            'CreatedTime'         = $createdTime
+            'LastModifiedTime'    = $lastModifiedTime
+            'Description'         = $description
+            'AppVersion'          = $appVersion
+            'SharedUsers'         = $sharedUsersCount
+            'SharedGroups'        = $sharedGroupsCount
+            'IsFeatured'          = $isFeaturedApp
+            'UsesPremium'         = $usesPremiumApi
             'UsesCustomConnector' = $usesCustomApi
-            'UsesOnPremise' = $usesOnPremiseGateway
-            'IsCustomizable' = $isCustomizable
-            'BypassConsent' = $bypassConsent
-            'Connectors' = $connectorList
-            'DatasetUrls' = $datasetUrlList
+            'UsesOnPremise'       = $usesOnPremiseGateway
+            'IsCustomizable'      = $isCustomizable
+            'BypassConsent'       = $bypassConsent
+            'AppDetailFetchStatus' = $appDetailFetchStatus
+            'Connectors'          = $connectorList
+            'DatasetUrls'         = $datasetUrlList
         }
     }
     
@@ -1919,6 +2022,48 @@ function Export-PowerAutomateFlowsToCSV {
     
     $csvRows = @()
     $seenFlowIds = @()
+
+    function Add-UniqueTextValue {
+        param (
+            [Parameter()] $Collection,
+            [Parameter()] $Value
+        )
+
+        if ($null -eq $Collection) { return }
+        if ($null -eq $Value) { return }
+        $text = [string]$Value
+        if ([string]::IsNullOrWhiteSpace($text)) { return }
+
+        # Guard method calls so an empty/odd payload shape cannot break export.
+        if ($Collection.PSObject.Methods['Contains'] -and $Collection.PSObject.Methods['Add']) {
+            if (-not $Collection.Contains($text)) {
+                $Collection.Add($text) | Out-Null
+            }
+        }
+    }
+
+    function Get-OptionalFlowProperty {
+        param (
+            [Parameter()] $InputObject,
+            [Parameter(Mandatory)] [string] $PropertyPath
+        )
+
+        if ($null -eq $InputObject) { return $null }
+
+        try {
+            $value = $InputObject
+            foreach ($segment in $PropertyPath -split '\.') {
+                if ($null -eq $value) { return $null }
+                $prop = $value.PSObject.Properties[$segment]
+                if ($null -eq $prop) { return $null }
+                $value = $prop.Value
+            }
+            return $value
+        }
+        catch {
+            return $null
+        }
+    }
     
     foreach ($flow in $Flows) {
         $flowId = try { $flow.workflowId } catch { $null }
@@ -1934,7 +2079,7 @@ function Export-PowerAutomateFlowsToCSV {
         $seenFlowIds += $flowId
         
         # Extract all available properties from the flow object
-        $flowName          = try { $flow.properties.displayName } catch { $null }
+        $flowName = try { $flow.properties.displayName } catch { $null }
         if (-not $flowName) { $flowName = try { $flow.displayName } catch { $null } }
         if (-not $flowName) { $flowName = try { $flow.name } catch { $null } }
         if (-not $flowName) { $flowName = '' }
@@ -1944,39 +2089,64 @@ function Export-PowerAutomateFlowsToCSV {
             $flowType = Resolve-FlowType -Flow $flow
         }
 
-        $flowState         = try { $flow.properties.state } catch { $null }
+        $flowState = try { $flow.properties.state } catch { $null }
         if (-not $flowState) { $flowState = try { $flow.state } catch { $null } }
         if (-not $flowState) { $flowState = try { $flow.stateCode } catch { $null } }
         if (-not $flowState) { $flowState = try { $flow.properties.status } catch { $null } }
         if (-not $flowState) { $flowState = try { $flow.statusCode } catch { $null } }
         if (-not $flowState) { $flowState = 'Unknown' }
 
-        $flowOwner         = try { $flow.properties.owner.displayName } catch { $null }
-        if (-not $flowOwner) { $flowOwner = try { $flow.owner.displayName } catch { $null } }
-        if (-not $flowOwner) { $flowOwner = try { $flow.properties.createdBy.displayName } catch { $null } }
-        if (-not $flowOwner) { $flowOwner = try { $flow.properties.creator.displayName } catch { $null } }
-        if (-not $flowOwner) { $flowOwner = try { $flow.ownerId } catch { $null } }
-        if (-not $flowOwner) { $flowOwner = try { $flow.createdBy } catch { $null } }
-        if (-not $flowOwner) { $flowOwner = 'Unknown' }
+        $ownerNames = [System.Collections.Generic.List[string]]::new()
+        $ownerIds = [System.Collections.Generic.List[string]]::new()
 
-        $flowCreatedTime   = try { $flow.properties.createdTime } catch { $null }
+        # Preferred human-readable owner hints
+        Add-UniqueTextValue -Collection $ownerNames -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'properties.owner.displayName')
+        Add-UniqueTextValue -Collection $ownerNames -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'owner.displayName')
+        Add-UniqueTextValue -Collection $ownerNames -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'properties.createdBy.displayName')
+        Add-UniqueTextValue -Collection $ownerNames -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'properties.creator.displayName')
+        Add-UniqueTextValue -Collection $ownerNames -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'properties.creator.userPrincipalName')
+        Add-UniqueTextValue -Collection $ownerNames -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'properties.creator.email')
+
+        # Stable identity hints for tenants where display names are not returned
+        Add-UniqueTextValue -Collection $ownerIds -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'ownerId')
+        Add-UniqueTextValue -Collection $ownerIds -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'createdBy')
+        Add-UniqueTextValue -Collection $ownerIds -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'properties.owner.id')
+        Add-UniqueTextValue -Collection $ownerIds -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'properties.owner.objectId')
+        Add-UniqueTextValue -Collection $ownerIds -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'properties.createdBy.id')
+        Add-UniqueTextValue -Collection $ownerIds -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'properties.createdBy.objectId')
+        Add-UniqueTextValue -Collection $ownerIds -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'properties.createdBy.userId')
+        Add-UniqueTextValue -Collection $ownerIds -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'properties.creator.objectId')
+        Add-UniqueTextValue -Collection $ownerIds -Value (Get-OptionalFlowProperty -InputObject $flow -PropertyPath 'properties.creator.userId')
+
+        $ownerIdList = if ($ownerIds.Count -gt 0) { $ownerIds -join '; ' } else { '' }
+        $flowOwner = if ($ownerNames.Count -gt 0) {
+            $ownerNames -join '; '
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($ownerIdList)) {
+            $ownerIdList
+        }
+        else {
+            'Unknown'
+        }
+
+        $flowCreatedTime = try { $flow.properties.createdTime } catch { $null }
         if (-not $flowCreatedTime) { $flowCreatedTime = try { $flow.createdOn } catch { $null } }
         if (-not $flowCreatedTime) { $flowCreatedTime = try { $flow.createdTime } catch { $null } }
         if (-not $flowCreatedTime) { $flowCreatedTime = '' }
 
-        $flowModifiedTime  = try { $flow.properties.lastModifiedTime } catch { $null }
+        $flowModifiedTime = try { $flow.properties.lastModifiedTime } catch { $null }
         if (-not $flowModifiedTime) { $flowModifiedTime = try { $flow.modifiedOn } catch { $null } }
         if (-not $flowModifiedTime) { $flowModifiedTime = try { $flow.lastModifiedTime } catch { $null } }
         if (-not $flowModifiedTime) { $flowModifiedTime = '' }
         $flowDefinitionUri = try { $flow.properties.definitionUri } catch { $null }; if (-not $flowDefinitionUri) { $flowDefinitionUri = '' }
         
         # Extract additional flow properties
-        $templateName       = try { $flow.properties.templateName } catch { $null }; if (-not $templateName) { $templateName = '' }
+        $templateName = try { $flow.properties.templateName } catch { $null }; if (-not $templateName) { $templateName = '' }
         $provisioningMethod = try { $flow.properties.provisioningMethod } catch { $null }; if (-not $provisioningMethod) { $provisioningMethod = '' }
-        $flowPlan           = try { $flow.properties.plan } catch { $null }; if (-not $flowPlan) { $flowPlan = '' }
-        $flowFailureAlert   = try { $flow.properties.flowFailureAlertSubscribed } catch { $null }; if ($null -eq $flowFailureAlert) { $flowFailureAlert = 'False' }
-        $isManaged          = try { $flow.properties.isManaged } catch { $null }; if ($null -eq $isManaged) { $isManaged = 'False' }
-        $userType           = try { $flow.properties.userType } catch { $null }; if (-not $userType) { $userType = '' }
+        $flowPlan = try { $flow.properties.plan } catch { $null }; if (-not $flowPlan) { $flowPlan = '' }
+        $flowFailureAlert = try { $flow.properties.flowFailureAlertSubscribed } catch { $null }; if ($null -eq $flowFailureAlert) { $flowFailureAlert = 'False' }
+        $isManaged = try { $flow.properties.isManaged } catch { $null }; if ($null -eq $isManaged) { $isManaged = 'False' }
+        $userType = try { $flow.properties.userType } catch { $null }; if (-not $userType) { $userType = '' }
         
         # Extract connection references (connectors used in flow)
         $flowConnectors = @()
@@ -1986,13 +2156,13 @@ function Export-PowerAutomateFlowsToCSV {
         $embeddedRefs = @(Get-EmbeddedFlowConnectionReferences -Flow $flow)
         if ($embeddedRefs.Count -gt 0) {
             $flowConnectors += @($embeddedRefs | ForEach-Object {
-                if (-not [string]::IsNullOrWhiteSpace($_.ApiName)) {
-                    "{0} ({1})" -f $_.ReferenceName, $_.ApiName
-                }
-                else {
-                    $_.ReferenceName
-                }
-            })
+                    if (-not [string]::IsNullOrWhiteSpace($_.ApiName)) {
+                        "{0} ({1})" -f $_.ReferenceName, $_.ApiName
+                    }
+                    else {
+                        $_.ReferenceName
+                    }
+                })
         }
         if ($flowConnectors.Count -eq 0) {
             $embeddedDef = Get-EmbeddedFlowDefinition -Flow $flow
@@ -2011,7 +2181,8 @@ function Export-PowerAutomateFlowsToCSV {
             if ($sharePointUrls.Count -gt 0) { $sharePointUrls -join '; ' }
             elseif ($actualUrls.Count -gt 0) { @($actualUrls | Select-Object -Unique) -join '; ' }
             else { '' }
-        } else { 
+        }
+        else { 
             # Fallback: scan embedded definition text for explicit SharePoint URLs.
             $embeddedDefText = try { [string]$flow.definition } catch { '' }
             if (-not [string]::IsNullOrWhiteSpace($embeddedDefText)) {
@@ -2029,23 +2200,24 @@ function Export-PowerAutomateFlowsToCSV {
         
         # Build CSV row with ALL available flow properties
         $csvRows += [PSCustomObject]@{
-            'FlowName' = $flowName
-            'FlowId' = $flowId
-            'FlowType' = $flowType
-            'FlowState' = $flowState
-            'Owner' = $flowOwner
-            'Environment' = $EnvironmentName
-            'EnvironmentId' = $EnvironmentId
-            'CreatedTime' = $flowCreatedTime
-            'LastModifiedTime' = $flowModifiedTime
-            'TemplateName' = $templateName
+            'FlowName'           = $flowName
+            'FlowId'             = $flowId
+            'FlowType'           = $flowType
+            'FlowState'          = $flowState
+            'Owner'              = $flowOwner
+            'OwnerIds'           = $ownerIdList
+            'Environment'        = $EnvironmentName
+            'EnvironmentId'      = $EnvironmentId
+            'CreatedTime'        = $flowCreatedTime
+            'LastModifiedTime'   = $flowModifiedTime
+            'TemplateName'       = $templateName
             'ProvisioningMethod' = $provisioningMethod
-            'Plan' = $flowPlan
-            'UserType' = $userType
-            'FlowFailureAlert' = $flowFailureAlert
-            'IsManaged' = $isManaged
-            'Connectors' = $flowConnectorList
-            'URLs' = $flowUrlList
+            'Plan'               = $flowPlan
+            'UserType'           = $userType
+            'FlowFailureAlert'   = $flowFailureAlert
+            'IsManaged'          = $isManaged
+            'Connectors'         = $flowConnectorList
+            'URLs'               = $flowUrlList
         }
     }
     
@@ -2064,8 +2236,8 @@ try {
     $collectionScope = if ($null -ne $collectionScope) { $collectionScope.ToString().Trim() } else { '' }
     switch ($collectionScope.ToLowerInvariant()) {
         'flows' { $collectionScope = 'Flows'; break }
-        'apps'  { $collectionScope = 'Apps'; break }
-        'both'  { $collectionScope = 'Both'; break }
+        'apps' { $collectionScope = 'Apps'; break }
+        'both' { $collectionScope = 'Both'; break }
     }
 
     # Validate collection scope parameter
@@ -2122,7 +2294,7 @@ try {
     }
 
     $environments = @($environments)
-    $environments = @(Filter-Environments -Environments $environments -IncludeEnvironment $Environment -ExcludeEnvironment $ExcludeEnvironment)
+    $environments = @(Select-Environments -Environments $environments -IncludeEnvironment $Environment -ExcludeEnvironment $ExcludeEnvironment)
 
     if ($environments.Count -eq 0) {
         if (@($Environment).Count -gt 0 -or @($ExcludeEnvironment).Count -gt 0) {
@@ -2255,246 +2427,258 @@ try {
 
         # Process each flow (only if collecting flows)
         if ($collectionScope -in @('Flows', 'Both')) {
-        $flowTotal = $allFlows.Count
-        $flowProcessed = 0
-        foreach ($flow in $allFlows) {
-            $flowProcessed++
-            $flowName = try { $flow.properties.displayName } catch { $null }
-            if (-not $flowName) { $flowName = try { $flow.displayName } catch { $null } }
-            if (-not $flowName) { $flowName = try { $flow.name } catch { $null } }
-            if (-not $flowName) { $flowName = '(Unknown)' }
+            $flowTotal = $allFlows.Count
+            $flowProcessed = 0
+            foreach ($flow in $allFlows) {
+                $flowProcessed++
+                $flowName = try { $flow.properties.displayName } catch { $null }
+                if (-not $flowName) { $flowName = try { $flow.displayName } catch { $null } }
+                if (-not $flowName) { $flowName = try { $flow.name } catch { $null } }
+                if (-not $flowName) { $flowName = '(Unknown)' }
 
-            $flowId = try { $flow.workflowId } catch { $null }
-            if (-not $flowId) { $flowId = try { $flow.name } catch { $null } }
-            if (-not $flowId) { $flowId = try { $flow.id } catch { $null } }
+                $flowId = try { $flow.workflowId } catch { $null }
+                if (-not $flowId) { $flowId = try { $flow.name } catch { $null } }
+                if (-not $flowId) { $flowId = try { $flow.id } catch { $null } }
 
-            $flowIdCandidates = @(Get-FlowIdCandidates -Flow $flow)
-            if ($flowIdCandidates.Count -gt 0) {
-                $flowId = $flowIdCandidates[0]
-            }
+                $flowIdCandidates = @(Get-FlowIdCandidates -Flow $flow)
+                if ($flowIdCandidates.Count -gt 0) {
+                    $flowId = $flowIdCandidates[0]
+                }
 
-            $flowState = try { $flow.properties.state } catch { $null }
-            if (-not $flowState) { $flowState = try { $flow.state } catch { $null } }
-            if (-not $flowState) { $flowState = try { $flow.properties.status } catch { $null } }
-            if (-not $flowState) { $flowState = 'Unknown' }
+                $flowState = try { $flow.properties.state } catch { $null }
+                if (-not $flowState) { $flowState = try { $flow.state } catch { $null } }
+                if (-not $flowState) { $flowState = try { $flow.properties.status } catch { $null } }
+                if (-not $flowState) { $flowState = 'Unknown' }
 
-            $flowType = Resolve-FlowType -Flow $flow
+                $flowType = Resolve-FlowType -Flow $flow
             
-            Write-Host "    ┌─ Flow: $flowName" -ForegroundColor Cyan
-            Write-Host "    │  ID: $flowId" -ForegroundColor DarkGray
-            Write-Host "    │  Type: $flowType | State: $flowState" -ForegroundColor DarkGray
+                Write-Host "    ┌─ Flow: $flowName" -ForegroundColor Cyan
+                Write-Host "    │  ID: $flowId" -ForegroundColor DarkGray
+                Write-Host "    │  Type: $flowType | State: $flowState" -ForegroundColor DarkGray
 
-            # Get flow definition - check if flowId is valid
-            if ([string]::IsNullOrWhiteSpace($flowId)) {
-                Write-Warning "Flow ID is empty, skipping flow details"
-                Write-Host "    │" -ForegroundColor Cyan
-                Write-Host "    └─────────────────────────────────────`n" -ForegroundColor Cyan
-                continue
-            }
-            
-            $flowDef = Get-EmbeddedFlowDefinition -Flow $flow
-            if (-not $flowDef) {
-                $flowDef = Get-FlowDetails -EnvironmentId $envId -FlowIds $flowIdCandidates
-            }
-
-            $flowType = Resolve-FlowType -Flow $flow -FlowDefinition $flowDef
-            if ($flow.PSObject.Properties['__NormalizedFlowType']) {
-                $flow.PSObject.Properties['__NormalizedFlowType'].Value = $flowType
-            }
-            else {
-                $flow | Add-Member -NotePropertyName '__NormalizedFlowType' -NotePropertyValue $flowType
-            }
-
-            Write-Host "    │  Normalized Type: $flowType" -ForegroundColor DarkGray
-
-            if ($flowDef) {
-                # Extract HTTP connectors and URLs
-                $extracted = Extract-HttpConnectorsAndUrls -FlowDefinition $flowDef
-                $allActions = $extracted.AllActions
-                $httpConnectors = $extracted.HttpConnectors
-                $urls = $extracted.Urls
-                $flowUrlMap[$flowId] = $urls
-
-                if ($DumpOneFlowObjectPerEnvironment -and -not $flowObjectDumped) {
-                    try {
-                        $debugFlowPath = Join-Path $OutputFolder ("FlowObjectDebug_{0}_{1}.json" -f ($envId -replace '[^a-zA-Z0-9_-]', '_'), (Get-Date -Format 'yyyyMMdd_HHmmss'))
-                        $debugFlowObject = [PSCustomObject]@{
-                            EnvironmentName = $envName
-                            EnvironmentId = $envId
-                            FlowName = $flowName
-                            FlowId = $flowId
-                            FlowIdCandidates = $flowIdCandidates
-                            ExtractedUrls = @($urls)
-                            SharePointUrls = @($urls | Where-Object { $_ -is [string] -and $_ -match 'https?://[^\s]*sharepoint\.com' } | Select-Object -Unique)
-                            RawFlow = $flow
-                            ParsedFlowDefinition = $flowDef
-                        }
-                        $debugFlowObject | ConvertTo-Json -Depth 100 | Out-File -FilePath $debugFlowPath -Encoding utf8
-                        Write-Host "    [DEBUG] Wrote flow debug object: $debugFlowPath" -ForegroundColor DarkGray
-                        $flowObjectDumped = $true
-                    }
-                    catch {
-                        if ($debug) { Write-Host "    [DEBUG] Failed to write flow debug object: $($_.Exception.Message)" -ForegroundColor DarkGray }
-                    }
-                }
-
-                # Display ALL Actions
-                if ($allActions.Count -gt 0) {
+                # Get flow definition - check if flowId is valid
+                if ([string]::IsNullOrWhiteSpace($flowId)) {
+                    Write-Warning "Flow ID is empty, skipping flow details"
                     Write-Host "    │" -ForegroundColor Cyan
-                    Write-Host "    ├─ All Actions & Triggers ($($allActions.Count)):" -ForegroundColor Yellow
-                    foreach ($action in $allActions) {
-                        $actionType = $action.Type
-                        $actionKind = $action.Kind
-                        $connName = $action.ConnectorName
-                        $actionName = $action.Name
-                        $isHttp = if ($action.ContainsKey('IsHttp') -and $action.IsHttp) { ' [HTTP]' } else { '' }
-                        
-                        Write-Host "    │  ├─ $actionName$isHttp" -ForegroundColor White
-                        Write-Host "    │  │  └─ Type: $actionType | Kind: $actionKind | Connector: $connName" -ForegroundColor DarkGray
-                        
-                        if ($action.ContainsKey('Method') -and $action.Method) {
-                            Write-Host "    │  │     Method: $($action.Method)" -ForegroundColor DarkGray
-                        }
-                        if ($action.ContainsKey('DependsOn') -and $action.DependsOn) {
-                            Write-Host "    │  │     DependsOn: $($action.DependsOn)" -ForegroundColor DarkGray
-                        }
-                    }
-                }
-
-                # Display HTTP Connectors (highlighted)
-                if ($httpConnectors.Count -gt 0) {
-                    Write-Host "    │" -ForegroundColor Cyan
-                    Write-Host "    ├─ HTTP/API Connectors ($($httpConnectors.Count)) [HIGHLIGHTED]:" -ForegroundColor Green
-                    foreach ($connector in $httpConnectors) {
-                        Write-Host "    │  ├─ $($connector.Name)" -ForegroundColor Green
-                        Write-Host "    │  │  ├─ Type: $($connector.Type)" -ForegroundColor White
-                        Write-Host "    │  │  ├─ Kind: $($connector.Kind)" -ForegroundColor White
-                        Write-Host "    │  │  └─ Connector: $($connector.ConnectorName)" -ForegroundColor White
-                        if ($connector.ContainsKey('Method') -and $connector.Method) {
-                            Write-Host "    │  │     Method: $($connector.Method)" -ForegroundColor White
-                        }
-                        if ($connector.ContainsKey('DependsOn') -and $connector.DependsOn) {
-                            Write-Host "    │  │     DependsOn: $($connector.DependsOn)" -ForegroundColor DarkGray
-                        }
-                    }
-                }
-                else {
-                    # Show if there are OpenApiConnection actions even if no HTTP detected
-                    $hasApiConnections = $allActions | Where-Object { $_.Kind -eq 'OpenApiConnection' }
-                    if ($hasApiConnections) {
-                        Write-Host "    │" -ForegroundColor Cyan
-                        Write-Host "    ├─ API Connectors (OpenApiConnection): $($hasApiConnections | Measure-Object | Select-Object -ExpandProperty Count)" -ForegroundColor Cyan
-                        foreach ($apiAction in $hasApiConnections) {
-                            Write-Host "    │  ├─ $($apiAction.Name) [$($apiAction.ConnectorName)]" -ForegroundColor Cyan
-                        }
-                    }
-                }
-
-                # Display URLs
-                if ($urls.Count -gt 0) {
-                    Write-Host "    │" -ForegroundColor Cyan
-                    Write-Host "    ├─ URLs & Endpoints ($($urls.Count)):" -ForegroundColor Cyan
-                    foreach ($url in $urls) {
-                        $urlDisplay = if ($url.Length -gt 120) { "$($url.Substring(0, 117))..." } else { $url }
-                        Write-Host "    │  ├─ $urlDisplay" -ForegroundColor White
-                    }
-                }
-            }
-            else {
-                Write-Host "    │" -ForegroundColor Cyan
-                Write-Host "    ├─ (Could not retrieve flow definition)" -ForegroundColor Yellow
-            }
-
-            Write-Host "    │" -ForegroundColor Cyan
-            Write-Host "    └─────────────────────────────────────`n" -ForegroundColor Cyan
-
-            if (($flowProcessed % $ProgressUpdateEvery -eq 0) -or ($flowProcessed -eq $flowTotal)) {
-                Write-Host "  Progress (Flows): $flowProcessed/$flowTotal processed in '$envName'" -ForegroundColor DarkCyan
-            }
-        }
-        }
-
-        # Process Power Apps (only if collecting apps)
-        if ($collectionScope -in @('Apps', 'Both')) {
-        if ($powerApps.Count -gt 0) {
-            Write-Host "  Power Apps:" -ForegroundColor Yellow
-            $appTotal = $powerApps.Count
-            $appProcessed = 0
-            foreach ($app in $powerApps) {
-                $appProcessed++
-                # Handle different property names from different API endpoints
-                $appName  = try { $app.displayName } catch { $null }
-                if (-not $appName) { $appName  = try { $app.properties.displayName } catch { $null } }
-                if (-not $appName) { $appName  = try { $app.name } catch { $null } }
-                if (-not $appName) { $appName  = '(Unknown)' }
-
-                $appId    = try { $app.appId } catch { $null }
-                if (-not $appId)   { $appId    = try { $app.properties.appId } catch { $null } }
-                if (-not $appId)   { $appId    = try { $app.name } catch { $null } }
-                if (-not $appId)   { $appId    = try { $app.id } catch { $null } }
-                if (-not $appId)   { $appId    = '' }
-                
-                # Skip apps with empty IDs
-                if ([string]::IsNullOrWhiteSpace($appId)) {
-                    if ($debug) { Write-Host "    [DEBUG] Skipping app with empty ID: $appName" -ForegroundColor Yellow }
+                    Write-Host "    └─────────────────────────────────────`n" -ForegroundColor Cyan
                     continue
                 }
-                
-                $appType  = try { $app.appType } catch { $null }
-                if (-not $appType)  { $appType  = try { $app.properties.appType } catch { $null } }
-                if (-not $appType)  { $appType  = 'Unknown' }
+            
+                $flowDef = Get-EmbeddedFlowDefinition -Flow $flow
+                if (-not $flowDef) {
+                    $flowDef = Get-FlowDetails -EnvironmentId $envId -FlowIds $flowIdCandidates
+                }
 
-                $appState = try { $app.state } catch { $null }
-                if (-not $appState) { $appState = try { $app.properties.state } catch { $null } }
-                if (-not $appState) { $appState = try { $app.properties.status } catch { $null } }
-                if (-not $appState) { $appState = 'Unknown' }
-                
-                Write-Host "    ┌─ App: $appName" -ForegroundColor Magenta
-                Write-Host "    │  ID: $appId" -ForegroundColor DarkGray
-                Write-Host "    │  Type: $appType | State: $appState" -ForegroundColor DarkGray
-                
-                # Try to get app details
-                $appDef = Get-PowerAppDetails -AppId $appId -EnvironmentId $envId
-                
-                if ($appDef) {
-                    $appConnectorInfo = Extract-AppConnectors -AppDefinition $appDef
-                    $appConnectors = $appConnectorInfo.Connectors
-                    $appUrls = $appConnectorInfo.Urls
-                    
-                    # Display connectors
-                    if ($appConnectors.Count -gt 0) {
-                        Write-Host "    │" -ForegroundColor Magenta
-                        Write-Host "    ├─ Connectors ($($appConnectors.Count)):" -ForegroundColor Green
-                        foreach ($connector in $appConnectors) {
-                            Write-Host "    │  ├─ $($connector.Name)" -ForegroundColor White
-                            if ($connector.Type -and $connector.Type -ne 'Unknown') {
-                                Write-Host "    │  │  └─ Type: $($connector.Type)" -ForegroundColor DarkGray
+                $flowType = Resolve-FlowType -Flow $flow -FlowDefinition $flowDef
+                if ($flow.PSObject.Properties['__NormalizedFlowType']) {
+                    $flow.PSObject.Properties['__NormalizedFlowType'].Value = $flowType
+                }
+                else {
+                    $flow | Add-Member -NotePropertyName '__NormalizedFlowType' -NotePropertyValue $flowType
+                }
+
+                Write-Host "    │  Normalized Type: $flowType" -ForegroundColor DarkGray
+
+                if ($flowDef) {
+                    # Extract HTTP connectors and URLs
+                    $extracted = Get-HttpConnectorsAndUrlsFromFlow -FlowDefinition $flowDef
+                    $allActions = $extracted.AllActions
+                    $httpConnectors = $extracted.HttpConnectors
+                    $urls = $extracted.Urls
+                    $flowUrlMap[$flowId] = $urls
+
+                    if ($DumpOneFlowObjectPerEnvironment -and -not $flowObjectDumped) {
+                        try {
+                            $debugFlowPath = Join-Path $OutputFolder ("FlowObjectDebug_{0}_{1}.json" -f ($envId -replace '[^a-zA-Z0-9_-]', '_'), (Get-Date -Format 'yyyyMMdd_HHmmss'))
+                            $debugFlowObject = [PSCustomObject]@{
+                                EnvironmentName      = $envName
+                                EnvironmentId        = $envId
+                                FlowName             = $flowName
+                                FlowId               = $flowId
+                                FlowIdCandidates     = $flowIdCandidates
+                                ExtractedUrls        = @($urls)
+                                SharePointUrls       = @($urls | Where-Object { $_ -is [string] -and $_ -match 'https?://[^\s]*sharepoint\.com' } | Select-Object -Unique)
+                                RawFlow              = $flow
+                                ParsedFlowDefinition = $flowDef
                             }
-                            if ($connector.ConnectionRef) {
-                                Write-Host "    │  │  └─ ConnectionRef: $($connector.ConnectionRef)" -ForegroundColor DarkGray
+                            $debugFlowObject | ConvertTo-Json -Depth 100 | Out-File -FilePath $debugFlowPath -Encoding utf8
+                            Write-Host "    [DEBUG] Wrote flow debug object: $debugFlowPath" -ForegroundColor DarkGray
+                            $flowObjectDumped = $true
+                        }
+                        catch {
+                            if ($debug) { Write-Host "    [DEBUG] Failed to write flow debug object: $($_.Exception.Message)" -ForegroundColor DarkGray }
+                        }
+                    }
+
+                    # Display ALL Actions
+                    if ($allActions.Count -gt 0) {
+                        Write-Host "    │" -ForegroundColor Cyan
+                        Write-Host "    ├─ All Actions & Triggers ($($allActions.Count)):" -ForegroundColor Yellow
+                        foreach ($action in $allActions) {
+                            $actionType = $action.Type
+                            $actionKind = $action.Kind
+                            $connName = $action.ConnectorName
+                            $actionName = $action.Name
+                            $isHttp = if ($action.ContainsKey('IsHttp') -and $action.IsHttp) { ' [HTTP]' } else { '' }
+                        
+                            Write-Host "    │  ├─ $actionName$isHttp" -ForegroundColor White
+                            Write-Host "    │  │  └─ Type: $actionType | Kind: $actionKind | Connector: $connName" -ForegroundColor DarkGray
+                        
+                            if ($action.ContainsKey('Method') -and $action.Method) {
+                                Write-Host "    │  │     Method: $($action.Method)" -ForegroundColor DarkGray
+                            }
+                            if ($action.ContainsKey('DependsOn') -and $action.DependsOn) {
+                                Write-Host "    │  │     DependsOn: $($action.DependsOn)" -ForegroundColor DarkGray
                             }
                         }
                     }
-                    
+
+                    # Display HTTP Connectors (highlighted)
+                    if ($httpConnectors.Count -gt 0) {
+                        Write-Host "    │" -ForegroundColor Cyan
+                        Write-Host "    ├─ HTTP/API Connectors ($($httpConnectors.Count)) [HIGHLIGHTED]:" -ForegroundColor Green
+                        foreach ($connector in $httpConnectors) {
+                            Write-Host "    │  ├─ $($connector.Name)" -ForegroundColor Green
+                            Write-Host "    │  │  ├─ Type: $($connector.Type)" -ForegroundColor White
+                            Write-Host "    │  │  ├─ Kind: $($connector.Kind)" -ForegroundColor White
+                            Write-Host "    │  │  └─ Connector: $($connector.ConnectorName)" -ForegroundColor White
+                            if ($connector.ContainsKey('Method') -and $connector.Method) {
+                                Write-Host "    │  │     Method: $($connector.Method)" -ForegroundColor White
+                            }
+                            if ($connector.ContainsKey('DependsOn') -and $connector.DependsOn) {
+                                Write-Host "    │  │     DependsOn: $($connector.DependsOn)" -ForegroundColor DarkGray
+                            }
+                        }
+                    }
+                    else {
+                        # Show if there are OpenApiConnection actions even if no HTTP detected
+                        $hasApiConnections = $allActions | Where-Object { $_.Kind -eq 'OpenApiConnection' }
+                        if ($hasApiConnections) {
+                            Write-Host "    │" -ForegroundColor Cyan
+                            Write-Host "    ├─ API Connectors (OpenApiConnection): $($hasApiConnections | Measure-Object | Select-Object -ExpandProperty Count)" -ForegroundColor Cyan
+                            foreach ($apiAction in $hasApiConnections) {
+                                Write-Host "    │  ├─ $($apiAction.Name) [$($apiAction.ConnectorName)]" -ForegroundColor Cyan
+                            }
+                        }
+                    }
+
                     # Display URLs
-                    if ($appUrls.Count -gt 0) {
-                        Write-Host "    │" -ForegroundColor Magenta
-                        Write-Host "    ├─ URLs & Endpoints ($($appUrls.Count)):" -ForegroundColor Cyan
-                        foreach ($url in $appUrls) {
+                    if ($urls.Count -gt 0) {
+                        Write-Host "    │" -ForegroundColor Cyan
+                        Write-Host "    ├─ URLs & Endpoints ($($urls.Count)):" -ForegroundColor Cyan
+                        foreach ($url in $urls) {
                             $urlDisplay = if ($url.Length -gt 120) { "$($url.Substring(0, 117))..." } else { $url }
                             Write-Host "    │  ├─ $urlDisplay" -ForegroundColor White
                         }
                     }
                 }
-                
-                Write-Host "    │" -ForegroundColor Magenta
-                Write-Host "    └─────────────────────────────────────`n" -ForegroundColor Magenta
+                else {
+                    Write-Host "    │" -ForegroundColor Cyan
+                    Write-Host "    ├─ (Could not retrieve flow definition)" -ForegroundColor Yellow
+                }
 
-                if (($appProcessed % $ProgressUpdateEvery -eq 0) -or ($appProcessed -eq $appTotal)) {
-                    Write-Host "  Progress (Apps): $appProcessed/$appTotal processed in '$envName'" -ForegroundColor DarkMagenta
+                Write-Host "    │" -ForegroundColor Cyan
+                Write-Host "    └─────────────────────────────────────`n" -ForegroundColor Cyan
+
+                if (($flowProcessed % $ProgressUpdateEvery -eq 0) -or ($flowProcessed -eq $flowTotal)) {
+                    Write-Host "  Progress (Flows): $flowProcessed/$flowTotal processed in '$envName'" -ForegroundColor DarkCyan
                 }
             }
         }
+
+        # Process Power Apps (only if collecting apps)
+        if ($collectionScope -in @('Apps', 'Both')) {
+            if ($powerApps.Count -gt 0) {
+                Write-Host "  Power Apps:" -ForegroundColor Yellow
+                $appTotal = $powerApps.Count
+                $appProcessed = 0
+                foreach ($app in $powerApps) {
+                    $appProcessed++
+                    # Handle different property names from different API endpoints
+                    $appName = try { $app.displayName } catch { $null }
+                    if (-not $appName) { $appName = try { $app.properties.displayName } catch { $null } }
+                    if (-not $appName) { $appName = try { $app.name } catch { $null } }
+                    if (-not $appName) { $appName = '(Unknown)' }
+
+                    $appId = try { $app.appId } catch { $null }
+                    if (-not $appId) { $appId = try { $app.properties.appId } catch { $null } }
+                    if (-not $appId) { $appId = try { $app.name } catch { $null } }
+                    if (-not $appId) { $appId = try { $app.id } catch { $null } }
+                    if (-not $appId) { $appId = '' }
+                
+                    # Skip apps with empty IDs
+                    if ([string]::IsNullOrWhiteSpace($appId)) {
+                        if ($debug) { Write-Host "    [DEBUG] Skipping app with empty ID: $appName" -ForegroundColor Yellow }
+                        continue
+                    }
+                
+                    $appType = try { $app.appType } catch { $null }
+                    if (-not $appType) { $appType = try { $app.properties.appType } catch { $null } }
+                    if (-not $appType) { $appType = 'Unknown' }
+
+                    $appState = try { $app.state } catch { $null }
+                    if (-not $appState) { $appState = try { $app.properties.state } catch { $null } }
+                    if (-not $appState) { $appState = try { $app.properties.status } catch { $null } }
+                    if (-not $appState) { $appState = 'Unknown' }
+                
+                    Write-Host "    ┌─ App: $appName" -ForegroundColor Magenta
+                    Write-Host "    │  ID: $appId" -ForegroundColor DarkGray
+                    Write-Host "    │  Type: $appType | State: $appState" -ForegroundColor DarkGray
+                
+                    # Try to get app details
+                    $appDetailResult = Get-PowerAppDetails -AppId $appId -EnvironmentId $envId
+                    $appDetailFetchStatus = if ($appDetailResult -and $appDetailResult.Status) { [string]$appDetailResult.Status } else { 'Unknown' }
+                    if ($app.PSObject.Properties['__AppDetailFetchStatus']) {
+                        $app.PSObject.Properties['__AppDetailFetchStatus'].Value = $appDetailFetchStatus
+                    }
+                    else {
+                        $app | Add-Member -NotePropertyName '__AppDetailFetchStatus' -NotePropertyValue $appDetailFetchStatus
+                    }
+
+                    $appDef = if ($appDetailResult) { $appDetailResult.Definition } else { $null }
+
+                    if ($appDef) {
+                        $appConnectorInfo = Get-AppConnectorsFromDefinition -AppDefinition $appDef
+                        $appConnectors = $appConnectorInfo.Connectors
+                        $appUrls = $appConnectorInfo.Urls
+                    
+                        # Display connectors
+                        if ($appConnectors.Count -gt 0) {
+                            Write-Host "    │" -ForegroundColor Magenta
+                            Write-Host "    ├─ Connectors ($($appConnectors.Count)):" -ForegroundColor Green
+                            foreach ($connector in $appConnectors) {
+                                Write-Host "    │  ├─ $($connector.Name)" -ForegroundColor White
+                                if ($connector.Type -and $connector.Type -ne 'Unknown') {
+                                    Write-Host "    │  │  └─ Type: $($connector.Type)" -ForegroundColor DarkGray
+                                }
+                                if ($connector.ConnectionRef) {
+                                    Write-Host "    │  │  └─ ConnectionRef: $($connector.ConnectionRef)" -ForegroundColor DarkGray
+                                }
+                            }
+                        }
+                    
+                        # Display URLs
+                        if ($appUrls.Count -gt 0) {
+                            Write-Host "    │" -ForegroundColor Magenta
+                            Write-Host "    ├─ URLs & Endpoints ($($appUrls.Count)):" -ForegroundColor Cyan
+                            foreach ($url in $appUrls) {
+                                $urlDisplay = if ($url.Length -gt 120) { "$($url.Substring(0, 117))..." } else { $url }
+                                Write-Host "    │  ├─ $urlDisplay" -ForegroundColor White
+                            }
+                        }
+                    }
+                    else {
+                        Write-Host "    │  App detail status: $appDetailFetchStatus" -ForegroundColor DarkYellow
+                    }
+                
+                    Write-Host "    │" -ForegroundColor Magenta
+                    Write-Host "    └─────────────────────────────────────`n" -ForegroundColor Magenta
+
+                    if (($appProcessed % $ProgressUpdateEvery -eq 0) -or ($appProcessed -eq $appTotal)) {
+                        Write-Host "  Progress (Apps): $appProcessed/$appTotal processed in '$envName'" -ForegroundColor DarkMagenta
+                    }
+                }
+            }
         }
 
         # Collect data for CSV export
@@ -2520,26 +2704,26 @@ try {
         
         # Collect Power Automate flows data with URLs (only if collecting flows)
         if ($collectionScope -in @('Flows', 'Both')) {
-        if ($allFlows.Count -gt 0) {
-            if ($debug) { Write-Host "    [DEBUG-EXPORT] Processing $($allFlows.Count) flows" -ForegroundColor DarkGray }
+            if ($allFlows.Count -gt 0) {
+                if ($debug) { Write-Host "    [DEBUG-EXPORT] Processing $($allFlows.Count) flows" -ForegroundColor DarkGray }
 
-            $flowsExport = Export-PowerAutomateFlowsToCSV -Flows $allFlows -EnvironmentName $envName -EnvironmentId $envId -FlowUrls $flowUrlMap
-            if ($flowsExport.Count -gt 0) {
-                if (Test-Path -Path $flowsOutputPath) {
-                    $flowsExport | Export-Csv -Path $flowsOutputPath -NoTypeInformation -Encoding UTF8 -Append
+                $flowsExport = Export-PowerAutomateFlowsToCSV -Flows $allFlows -EnvironmentName $envName -EnvironmentId $envId -FlowUrls $flowUrlMap
+                if ($flowsExport.Count -gt 0) {
+                    if (Test-Path -Path $flowsOutputPath) {
+                        $flowsExport | Export-Csv -Path $flowsOutputPath -NoTypeInformation -Encoding UTF8 -Append
+                    }
+                    else {
+                        $flowsExport | Export-Csv -Path $flowsOutputPath -NoTypeInformation -Encoding UTF8
+                    }
+                    $totalFlowsExported += $flowsExport.Count
                 }
-                else {
-                    $flowsExport | Export-Csv -Path $flowsOutputPath -NoTypeInformation -Encoding UTF8
+                if ($debug) { Write-Host "    [DEBUG-EXPORT] Exported $($flowsExport.Count) flow action rows" -ForegroundColor DarkGray }
+                if ($debug) { 
+                    foreach ($row in $flowsExport | Select-Object -First 3) {
+                        Write-Host "      Row: Name=$($row.FlowName), URLs=$($row.URLs)" -ForegroundColor DarkGray
+                    }
                 }
-                $totalFlowsExported += $flowsExport.Count
             }
-            if ($debug) { Write-Host "    [DEBUG-EXPORT] Exported $($flowsExport.Count) flow action rows" -ForegroundColor DarkGray }
-            if ($debug) { 
-                foreach ($row in $flowsExport | Select-Object -First 3) {
-                    Write-Host "      Row: Name=$($row.FlowName), URLs=$($row.URLs)" -ForegroundColor DarkGray
-                }
-            }
-        }
         }
 
         Write-Host "  Environment complete. Current totals written to disk: Apps=$totalAppsExported, Flows=$totalFlowsExported" -ForegroundColor Green
@@ -2554,24 +2738,24 @@ try {
 
     # Power Apps summary (only if collecting apps)
     if ($collectionScope -in @('Apps', 'Both')) {
-    if ($totalAppsExported -gt 0) {
-        Write-Host "Power Apps report exported to: $appsOutputPath" -ForegroundColor Green
-        Write-Host "  Total Power Apps exported: $totalAppsExported rows" -ForegroundColor Cyan
-    }
-    else {
-        Write-Host "  No Power Apps to export." -ForegroundColor DarkGray
-    }
+        if ($totalAppsExported -gt 0) {
+            Write-Host "Power Apps report exported to: $appsOutputPath" -ForegroundColor Green
+            Write-Host "  Total Power Apps exported: $totalAppsExported rows" -ForegroundColor Cyan
+        }
+        else {
+            Write-Host "  No Power Apps to export." -ForegroundColor DarkGray
+        }
     }
     
     # Power Automate summary (only if collecting flows)
     if ($collectionScope -in @('Flows', 'Both')) {
-    if ($totalFlowsExported -gt 0) {
-        Write-Host "Power Automate flows report exported to: $flowsOutputPath" -ForegroundColor Green
-        Write-Host "  Total flow actions exported: $totalFlowsExported rows" -ForegroundColor Cyan
-    }
-    else {
-        Write-Host "  No Power Automate flows to export." -ForegroundColor DarkGray
-    }
+        if ($totalFlowsExported -gt 0) {
+            Write-Host "Power Automate flows report exported to: $flowsOutputPath" -ForegroundColor Green
+            Write-Host "  Total flows exported: $totalFlowsExported rows" -ForegroundColor Cyan
+        }
+        else {
+            Write-Host "  No Power Automate flows to export." -ForegroundColor DarkGray
+        }
     }
     
     Write-Host "`nScript completed successfully." -ForegroundColor Green
