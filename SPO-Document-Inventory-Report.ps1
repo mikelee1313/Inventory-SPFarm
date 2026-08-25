@@ -373,7 +373,7 @@ function Get-ListNameFromLibraryUrl {
     }
   }
 
-  $segments = $candidate.Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  $segments = @($candidate.Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
   if ($segments.Count -eq 0) {
     throw "Could not identify the library name from '$LibraryInput'."
@@ -388,27 +388,17 @@ function Get-ResolvedLibraryName {
     [Parameter(Mandatory)] [string]$LibraryInput
   )
 
-  $libraryList = Get-PnPList -Includes RootFolder | Where-Object {
-    $rootUrl = $_.RootFolder.ServerRelativeUrl
-    $normalizedRoot = $rootUrl.Trim('/').ToLowerInvariant()
-    $normalizedInput = $LibraryInput.Trim().Trim('/').ToLowerInvariant()
+  $candidateName = Get-ListNameFromLibraryUrl -LibraryInput $LibraryInput
+  $libraryList = $null
 
-    if ($normalizedInput -match '^https?://') {
-      $uri = [Uri]$normalizedInput
-      $normalizedInput = [Uri]::UnescapeDataString($uri.AbsolutePath).Trim('/').ToLowerInvariant()
+  foreach ($identity in @($LibraryInput.Trim().Trim('/'), $candidateName) | Select-Object -Unique) {
+    try {
+      $libraryList = Get-PnPList -Identity $identity -Includes RootFolder -ErrorAction Stop
+      if ($null -ne $libraryList) { break }
     }
-
-    $normalizedInput = $normalizedInput.Replace('%20', ' ')
-    $normalizedRoot = $normalizedRoot.Replace('%20', ' ')
-
-    $normalizedInput -eq $normalizedRoot -or
-    $normalizedInput.EndsWith('/' + $normalizedRoot) -or
-    $normalizedRoot.EndsWith('/' + $normalizedInput)
-  } | Select-Object -First 1
-
-  if ($null -eq $libraryList) {
-    $candidateName = Get-ListNameFromLibraryUrl -LibraryInput $LibraryInput
-    $libraryList = Get-PnPList -Includes RootFolder | Where-Object { $_.Title -eq $candidateName } | Select-Object -First 1
+    catch {
+      $libraryList = $null
+    }
   }
 
   if ($null -eq $libraryList) {
