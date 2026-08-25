@@ -12,6 +12,8 @@
   - Entra ID app registration with SharePoint application permissions
   - App auth configured with either certificate thumbprint or client secret
   - Admin consent granted for required permissions
+
+  .Version 5
 #>
 
 [CmdletBinding()]
