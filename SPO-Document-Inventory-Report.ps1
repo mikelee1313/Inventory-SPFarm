@@ -13,7 +13,7 @@
   - App auth configured with either certificate thumbprint or client secret
   - Admin consent granted for required permissions
 
-.Version 6
+.Version 7
 #>
 
 [CmdletBinding()]
@@ -468,18 +468,31 @@ function ConvertTo-InventoryRow {
   }
 }
 
-function Get-ImmediateChildFolders {
+function Get-ImmediateFolderContents {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)] [string]$FolderServerRelativeUrl
   )
 
-  Invoke-PnPWithRetry {
-    $context = Get-PnPContext
-    $folder = $context.Web.GetFolderByServerRelativeUrl($FolderServerRelativeUrl)
-    $context.Load($folder.Folders)
-    $context.ExecuteQuery()
-    return @($folder.Folders)
+  $contents = Invoke-PnPWithRetry {
+    $folder = Get-PnPFolder -Url $FolderServerRelativeUrl -ErrorAction Stop
+    Get-PnPProperty -ClientObject $folder -Property Files, Folders -ErrorAction Stop
+    return [pscustomobject]@{
+      Files = @($folder.Files)
+      Folders = @($folder.Folders)
+    }
+  }
+
+  $items = @($contents.Files) + @($contents.Folders)
+  $listItems = foreach ($item in $items) {
+    Get-PnPProperty -ClientObject $item -Property ListItemAllFields -ErrorAction Stop
+    $item.ListItemAllFields
+  }
+
+  return [pscustomobject]@{
+    Files = @($contents.Files)
+    Folders = @($contents.Folders)
+    ListItems = @($listItems)
   }
 }
 
@@ -493,39 +506,11 @@ function Export-LibraryInventoryReport {
     [Parameter()] [int]$ThrottleDelayMs = 0
   )
 
-  $fields = @('FSObjType', 'FileLeafRef', 'FileDirRef', 'Created', 'Modified', 'Author', 'Editor', 'ItemChildCount', 'FolderChildCount')
-
   $csvHeader = 'FolderPath,Name,CreatedBy,ModifiedBy,ModifiedDate,ItemType,ItemCount'
   [System.IO.File]::WriteAllText($OutputPath, $csvHeader + [Environment]::NewLine)
 
   $stats = @{ TotalItems = 0; FolderCount = 0; FileCount = 0 }
   $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-  # -ScriptBlock streams each page to disk immediately instead of buffering
-  # the whole (potentially multi-million row) result set in memory.
-  # Get-PnPListItem invokes this in a scope where scalar variables don't
-  # close over the caller, so counters are tracked via the $stats hashtable.
-  $pageHandler = {
-    param($pageItems)
-
-    $rows = foreach ($item in $pageItems) {
-      ConvertTo-InventoryRow -Item $item
-    }
-
-    $rows | Export-Csv -Path $OutputPath -NoTypeInformation -Append
-
-    foreach ($row in $rows) {
-      $stats.TotalItems++
-      if ($row.ItemType -eq 'Folder') { $stats.FolderCount++ }
-      elseif ($row.ItemType -eq 'File') { $stats.FileCount++ }
-    }
-
-    Write-Info ("Processed {0} items so far ({1:n1}s elapsed)..." -f $stats.TotalItems, $stopwatch.Elapsed.TotalSeconds)
-
-    if ($ThrottleDelayMs -gt 0) {
-      Start-Sleep -Milliseconds $ThrottleDelayMs
-    }
-  }.GetNewClosure()
 
   $web = Invoke-PnPWithRetry { Get-PnPWeb -Includes ServerRelativeUrl }
   $siteServerRelativeUrl = $web.ServerRelativeUrl.TrimEnd('/')
@@ -542,17 +527,32 @@ function Export-LibraryInventoryReport {
     Write-Info "Processing folder: $currentFolderServerRelativeUrl"
 
     try {
-      $childFolders = @(Get-ImmediateChildFolders -FolderServerRelativeUrl $currentFolderServerRelativeUrl)
+      $contents = Get-ImmediateFolderContents -FolderServerRelativeUrl $currentFolderServerRelativeUrl
 
-      foreach ($childFolder in $childFolders) {
+      foreach ($childFolder in $contents.Folders) {
         $childFolderUrl = [string]$childFolder.ServerRelativeUrl
         if (-not [string]::IsNullOrWhiteSpace($childFolderUrl)) {
           $folderQueue.Enqueue($childFolderUrl.TrimEnd('/'))
         }
       }
 
-      Invoke-PnPWithRetry {
-        Get-PnPListItem -List $ListName -FolderServerRelativeUrl $currentFolderServerRelativeUrl -PageSize $PageSize -Fields $fields -ScriptBlock $pageHandler -ErrorAction Stop | Out-Null
+      $rows = @(foreach ($item in $contents.ListItems) {
+        ConvertTo-InventoryRow -Item $item
+      })
+      if ($rows.Count -gt 0) {
+        $rows | Export-Csv -Path $OutputPath -NoTypeInformation -Append
+      }
+
+      foreach ($row in $rows) {
+        $stats.TotalItems++
+        if ($row.ItemType -eq 'Folder') { $stats.FolderCount++ }
+        elseif ($row.ItemType -eq 'File') { $stats.FileCount++ }
+      }
+
+      Write-Info ("Processed {0} items so far ({1:n1}s elapsed)..." -f $stats.TotalItems, $stopwatch.Elapsed.TotalSeconds)
+
+      if ($ThrottleDelayMs -gt 0) {
+        Start-Sleep -Milliseconds $ThrottleDelayMs
       }
     }
     catch {
