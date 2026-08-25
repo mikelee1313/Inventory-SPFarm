@@ -13,7 +13,7 @@
   - App auth configured with either certificate thumbprint or client secret
   - Admin consent granted for required permissions
 
-  .Version 5
+.Version 6
 #>
 
 [CmdletBinding()]
@@ -468,6 +468,21 @@ function ConvertTo-InventoryRow {
   }
 }
 
+function Get-ImmediateChildFolders {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string]$FolderServerRelativeUrl
+  )
+
+  Invoke-PnPWithRetry {
+    $context = Get-PnPContext
+    $folder = $context.Web.GetFolderByServerRelativeUrl($FolderServerRelativeUrl)
+    $context.Load($folder.Folders)
+    $context.ExecuteQuery()
+    return @($folder.Folders)
+  }
+}
+
 function Export-LibraryInventoryReport {
   [CmdletBinding()]
   param(
@@ -524,17 +539,10 @@ function Export-LibraryInventoryReport {
     if ($visitedFolders.ContainsKey($normalizedFolderUrl)) { continue }
     $visitedFolders[$normalizedFolderUrl] = $true
 
-    $currentFolderSiteRelativeUrl = $currentFolderServerRelativeUrl
-    if ($currentFolderSiteRelativeUrl.StartsWith($siteServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
-      $currentFolderSiteRelativeUrl = $currentFolderSiteRelativeUrl.Substring($siteServerRelativeUrl.Length).Trim('/')
-    }
-
     Write-Info "Processing folder: $currentFolderServerRelativeUrl"
 
     try {
-      $childFolders = @(Invoke-PnPWithRetry {
-        Get-PnPFolderInFolder -FolderSiteRelativeUrl $currentFolderSiteRelativeUrl -ExcludeSystemFolders -ErrorAction Stop
-      })
+      $childFolders = @(Get-ImmediateChildFolders -FolderServerRelativeUrl $currentFolderServerRelativeUrl)
 
       foreach ($childFolder in $childFolders) {
         $childFolderUrl = [string]$childFolder.ServerRelativeUrl
