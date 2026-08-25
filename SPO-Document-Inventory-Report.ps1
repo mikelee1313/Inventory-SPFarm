@@ -510,16 +510,47 @@ function Export-LibraryInventoryReport {
     }
   }.GetNewClosure()
 
-  try {
-    Invoke-PnPWithRetry {
-      Get-PnPListItem -List $ListName -FolderServerRelativeUrl $FolderServerRelativeUrl -PageSize $PageSize -Fields $fields -ScriptBlock $pageHandler -ErrorAction Stop | Out-Null
+  $web = Invoke-PnPWithRetry { Get-PnPWeb -Includes ServerRelativeUrl }
+  $siteServerRelativeUrl = $web.ServerRelativeUrl.TrimEnd('/')
+  $folderQueue = New-Object System.Collections.Queue
+  $visitedFolders = @{}
+  $folderQueue.Enqueue($FolderServerRelativeUrl.TrimEnd('/'))
+
+  while ($folderQueue.Count -gt 0) {
+    $currentFolderServerRelativeUrl = [string]$folderQueue.Dequeue()
+    $normalizedFolderUrl = $currentFolderServerRelativeUrl.ToLowerInvariant()
+    if ($visitedFolders.ContainsKey($normalizedFolderUrl)) { continue }
+    $visitedFolders[$normalizedFolderUrl] = $true
+
+    $currentFolderSiteRelativeUrl = $currentFolderServerRelativeUrl
+    if ($currentFolderSiteRelativeUrl.StartsWith($siteServerRelativeUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
+      $currentFolderSiteRelativeUrl = $currentFolderSiteRelativeUrl.Substring($siteServerRelativeUrl.Length).Trim('/')
     }
-  }
-  catch {
-    if ($_.Exception.Message -match '(list view threshold|exceeds the list view threshold)') {
-      throw "SharePoint rejected the query because the target folder exceeds the list view threshold. Paging is enabled, but it cannot bypass this limit. Narrow FolderPath to a smaller subfolder or index/filter the library, then retry. Original error: $($_.Exception.Message)"
+
+    Write-Info "Processing folder: $currentFolderServerRelativeUrl"
+
+    try {
+      $childFolders = @(Invoke-PnPWithRetry {
+        Get-PnPFolderInFolder -FolderSiteRelativeUrl $currentFolderSiteRelativeUrl -ExcludeSystemFolders -ErrorAction Stop
+      })
+
+      foreach ($childFolder in $childFolders) {
+        $childFolderUrl = [string]$childFolder.ServerRelativeUrl
+        if (-not [string]::IsNullOrWhiteSpace($childFolderUrl)) {
+          $folderQueue.Enqueue($childFolderUrl.TrimEnd('/'))
+        }
+      }
+
+      Invoke-PnPWithRetry {
+        Get-PnPListItem -List $ListName -FolderServerRelativeUrl $currentFolderServerRelativeUrl -PageSize $PageSize -Fields $fields -ScriptBlock $pageHandler -ErrorAction Stop | Out-Null
+      }
     }
-    throw
+    catch {
+      if ($_.Exception.Message -match '(list view threshold|exceeds the list view threshold)') {
+        throw "SharePoint rejected the query for folder '$currentFolderServerRelativeUrl' because it exceeds the list view threshold. Split this folder into smaller subfolders or add an indexed filter. Original error: $($_.Exception.Message)"
+      }
+      throw
+    }
   }
 
   $stopwatch.Stop()
