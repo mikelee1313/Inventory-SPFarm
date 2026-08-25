@@ -509,7 +509,7 @@ function Export-LibraryInventoryReport {
   $csvHeader = 'FolderPath,Name,CreatedBy,ModifiedBy,ModifiedDate,ItemType,ItemCount'
   [System.IO.File]::WriteAllText($OutputPath, $csvHeader + [Environment]::NewLine)
 
-  $stats = @{ TotalItems = 0; FolderCount = 0; FileCount = 0 }
+  $stats = @{ TotalItems = 0; FolderCount = 0; FileCount = 0; ErrorCount = 0 }
   $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
   $web = Invoke-PnPWithRetry { Get-PnPWeb -Includes ServerRelativeUrl }
@@ -556,14 +556,10 @@ function Export-LibraryInventoryReport {
       }
     }
     catch {
-      if ($_.Exception.Message -match '(list view threshold|exceeds the list view threshold)') {
-        throw "SharePoint rejected the query for folder '$currentFolderServerRelativeUrl' because it exceeds the list view threshold. Split this folder into smaller subfolders or add an indexed filter. Original error: $($_.Exception.Message)"
-      }
-      if ($_.Exception.Message -match '(File Not Found|file or folder.*not found|does not exist|404)') {
-        Write-Warn "Skipping folder because it was not found or is no longer accessible: $currentFolderServerRelativeUrl"
-        continue
-      }
-      throw
+      $stats.ErrorCount++
+      $errorMessage = $_.Exception.Message
+      Write-Warn "Skipping folder after error: $currentFolderServerRelativeUrl | $errorMessage"
+      continue
     }
   }
 
@@ -573,6 +569,7 @@ function Export-LibraryInventoryReport {
     TotalItems = $stats.TotalItems
     FolderCount = $stats.FolderCount
     FileCount = $stats.FileCount
+    ErrorCount = $stats.ErrorCount
     ElapsedSeconds = $stopwatch.Elapsed.TotalSeconds
   }
 }
@@ -618,10 +615,10 @@ try {
   $summary = Export-LibraryInventoryReport -ListName $libraryName -FolderServerRelativeUrl $folderServerRelativeUrl -OutputPath $OutputPath -PageSize $PageSize -ThrottleDelayMs $ThrottleDelayMs
 
   if ($summary.TotalItems -eq 0) {
-    Write-Warn "No items found in the target library. A header-only CSV was written to: $OutputPath"
+    Write-Warn "No items found in the target library. A header-only CSV was written to: $OutputPath | Folders skipped after errors: $($summary.ErrorCount)"
   }
   else {
-    Write-Success ("Inventory report exported to: {0} | Items: {1} (Folders: {2}, Files: {3}) in {4:n1}s" -f $OutputPath, $summary.TotalItems, $summary.FolderCount, $summary.FileCount, $summary.ElapsedSeconds)
+    Write-Success ("Inventory report exported to: {0} | Items: {1} (Folders: {2}, Files: {3}) | Folders skipped after errors: {4} | Elapsed: {5:n1}s" -f $OutputPath, $summary.TotalItems, $summary.FolderCount, $summary.FileCount, $summary.ErrorCount, $summary.ElapsedSeconds)
   }
 }
 finally {
