@@ -13,7 +13,7 @@
   - App auth configured with either certificate thumbprint or client secret
   - Admin consent granted for required permissions
 
-.Version 7
+.Version 8
 #>
 
 [CmdletBinding()]
@@ -558,6 +558,10 @@ function Export-LibraryInventoryReport {
     catch {
       if ($_.Exception.Message -match '(list view threshold|exceeds the list view threshold)') {
         throw "SharePoint rejected the query for folder '$currentFolderServerRelativeUrl' because it exceeds the list view threshold. Split this folder into smaller subfolders or add an indexed filter. Original error: $($_.Exception.Message)"
+      }
+      if ($_.Exception.Message -match '(File Not Found|file or folder.*not found|does not exist|404)') {
+        Write-Warn "Skipping folder because it was not found or is no longer accessible: $currentFolderServerRelativeUrl"
+        continue
       }
       throw
     }
