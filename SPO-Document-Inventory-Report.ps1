@@ -47,7 +47,7 @@ param(
   [string]$ClientSecret = $env:PNP_CLIENT_SECRET,
 
   [Parameter()]
-  [int]$PageSize = 2000,
+  [int]$PageSize = 500,
 
   [Parameter()]
   [int]$ThrottleDelayMs = 0,
@@ -472,7 +472,7 @@ function Export-LibraryInventoryReport {
     [Parameter(Mandatory)] [string]$ListName,
     [Parameter(Mandatory)] [string]$FolderServerRelativeUrl,
     [Parameter(Mandatory)] [string]$OutputPath,
-    [Parameter()] [int]$PageSize = 2000,
+    [Parameter()] [int]$PageSize = 500,
     [Parameter()] [int]$ThrottleDelayMs = 0
   )
 
@@ -510,8 +510,16 @@ function Export-LibraryInventoryReport {
     }
   }.GetNewClosure()
 
-  Invoke-PnPWithRetry {
-    Get-PnPListItem -List $ListName -FolderServerRelativeUrl $FolderServerRelativeUrl -PageSize $PageSize -Fields $fields -ScriptBlock $pageHandler -ErrorAction Stop | Out-Null
+  try {
+    Invoke-PnPWithRetry {
+      Get-PnPListItem -List $ListName -FolderServerRelativeUrl $FolderServerRelativeUrl -PageSize $PageSize -Fields $fields -ScriptBlock $pageHandler -ErrorAction Stop | Out-Null
+    }
+  }
+  catch {
+    if ($_.Exception.Message -match '(list view threshold|exceeds the list view threshold)') {
+      throw "SharePoint rejected the query because the target folder exceeds the list view threshold. Paging is enabled, but it cannot bypass this limit. Narrow FolderPath to a smaller subfolder or index/filter the library, then retry. Original error: $($_.Exception.Message)"
+    }
+    throw
   }
 
   $stopwatch.Stop()
