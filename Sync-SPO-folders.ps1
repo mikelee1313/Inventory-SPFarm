@@ -18,7 +18,7 @@
   - App auth configured with either certificate thumbprint or client secret
   - Admin consent granted for required permissions
 
-.Version 9
+.Version 10 - added support for moving duplicate files and folders with the -MoveDuplicateFileandFolders parameter
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
