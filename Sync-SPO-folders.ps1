@@ -6,9 +6,11 @@
 .DESCRIPTION
   Connects to a SharePoint site using PnP.PowerShell and moves every file and folder found
   directly inside a source folder into a destination folder in the same document library.
-  If an item with the same name already exists at the destination, the moved item is
-  renamed by appending an incrementing number (e.g. Report.docx -> Report1.docx,
-  Archive -> Archive1) so that no existing content is overwritten.
+  If an item with the same name already exists at the destination, behaviour depends on
+  the -MoveDuplicateFileandFolders parameter. When $true (default) the moved item is renamed by
+  appending an incrementing number (e.g. Report.docx -> Report1.docx) so that no existing
+  content is overwritten, and same-named folders are merged. When $false the duplicate file
+  or folder is skipped entirely and left in the source location.
 
 .PREREQUISITES
   - PnP.PowerShell installed: Install-Module PnP.PowerShell -Scope CurrentUser
@@ -29,10 +31,10 @@ param(
   [string]$DocumentLibrary = 'Shared Documents',
 
   [Parameter()]
-  [string]$SourceFolderPath = 'general/clients/d',
+  [string]$SourceFolderPath = 'general/clients/j',
 
   [Parameter()]
-  [string]$DestinationFolderPath = 'clients/d',
+  [string]$DestinationFolderPath = 'clients/j',
 
   [Parameter()]
   [string]$TenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3',
@@ -53,6 +55,9 @@ param(
 
   [Parameter()]
   [string]$ClientSecret = $env:PNP_CLIENT_SECRET,
+
+  [Parameter()]
+  [bool]$MoveDuplicateFileandFolders = $false,
 
   [Parameter()]
   [int]$ThrottleDelayMs = 0,
@@ -419,7 +424,8 @@ function Move-FolderContentsRecursive {
     [Parameter(Mandatory)] [string]$DestinationFolderServerRelativeUrl,
     [Parameter(Mandatory)] [hashtable]$Stats,
     [Parameter(Mandatory)] [AllowEmptyCollection()] [System.Collections.Generic.List[object]]$LogRows,
-    [Parameter()] [int]$ThrottleDelayMs = 0
+    [Parameter()] [int]$ThrottleDelayMs = 0,
+    [Parameter()] [bool]$MoveDuplicateFileandFolders = $true
   )
 
   $sourceContents = Get-PnPFolderChildNames -FolderServerRelativeUrl $SourceFolderServerRelativeUrl
@@ -434,17 +440,29 @@ function Move-FolderContentsRecursive {
     $sourceUrl = "$SourceFolderServerRelativeUrl/$name"
 
     if ($destinationFolderNames.Contains($name)) {
+      if (-not $MoveDuplicateFileandFolders) {
+        $Stats.Skipped++
+        Write-Warn "Duplicate folder found. Skipped '$name'; left in source folder."
+        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = ''; ItemType = 'Folder'; Renamed = $false; Status = 'Skipped'; Error = 'Duplicate name at destination; MoveDuplicateFileandFolders is false.' })
+        continue
+      }
+
       # Same-named folder exists at destination: merge contents instead of renaming the folder.
       Write-Info "Folder '$name' already exists at destination. Merging contents."
       $destChildUrl = "$DestinationFolderServerRelativeUrl/$name"
       $errorsBeforeMerge = $Stats.Errors
-      Move-FolderContentsRecursive -SourceFolderServerRelativeUrl $sourceUrl -DestinationFolderServerRelativeUrl $destChildUrl -Stats $Stats -LogRows $LogRows -ThrottleDelayMs $ThrottleDelayMs
+      $skippedBeforeMerge = $Stats.Skipped
+      Move-FolderContentsRecursive -SourceFolderServerRelativeUrl $sourceUrl -DestinationFolderServerRelativeUrl $destChildUrl -Stats $Stats -LogRows $LogRows -ThrottleDelayMs $ThrottleDelayMs -MoveDuplicateFileandFolders $MoveDuplicateFileandFolders
 
-      # Only delete the source folder if nothing beneath it failed to move; otherwise leaving
-      # un-moved items behind and deleting the folder would send them to the recycle bin.
+      # Only delete the source folder if nothing beneath it failed to move or was intentionally
+      # left behind; otherwise deleting the folder would send those items to the recycle bin.
       if ($Stats.Errors -gt $errorsBeforeMerge) {
         Write-Warn "Skipping removal of source folder '$name': one or more nested items failed to move."
         $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; ItemType = 'Folder (merged)'; Renamed = $false; Status = 'Skipped'; Error = 'Nested item(s) failed to move; source folder retained.' })
+      }
+      elseif ($Stats.Skipped -gt $skippedBeforeMerge) {
+        Write-Warn "Skipping removal of source folder '$name': duplicate item(s) were retained in the source."
+        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; ItemType = 'Folder (merged)'; Renamed = $false; Status = 'Skipped'; Error = 'Duplicate item(s) retained in source; source folder retained.' })
       }
       elseif ($PSCmdlet.ShouldProcess($sourceUrl, "Remove now-empty source folder after merge")) {
         try {
@@ -486,6 +504,14 @@ function Move-FolderContentsRecursive {
   foreach ($file in $sourceContents.Files) {
     $Stats.Total++
     $originalName = $file.Name
+
+    if (-not $MoveDuplicateFileandFolders -and $destinationNames.Contains($originalName)) {
+      $Stats.Skipped++
+      Write-Warn "Duplicate found. Skipped '$originalName'; left in source folder."
+      $LogRows.Add([pscustomobject]@{ OriginalName = $originalName; MovedAsName = ''; ItemType = 'File'; Renamed = $false; Status = 'Skipped'; Error = 'Duplicate name at destination; MoveDuplicateFileandFolders is false.' })
+      continue
+    }
+
     $uniqueName = Get-UniqueItemName -Name $originalName -IsFolder $false -ExistingNames $destinationNames
     $wasRenamed = $uniqueName -ne $originalName
 
@@ -528,13 +554,14 @@ function Move-LibraryFolderItems {
     [Parameter(Mandatory)] [string]$SourceFolderServerRelativeUrl,
     [Parameter(Mandatory)] [string]$DestinationFolderServerRelativeUrl,
     [Parameter()] [int]$ThrottleDelayMs = 0,
+    [Parameter()] [bool]$MoveDuplicateFileandFolders = $true,
     [Parameter()] [string]$LogPath
   )
 
-  $stats = @{ Total = 0; Moved = 0; Renamed = 0; Merged = 0; Errors = 0 }
+  $stats = @{ Total = 0; Moved = 0; Renamed = 0; Merged = 0; Skipped = 0; Errors = 0 }
   $logRows = [System.Collections.Generic.List[object]]::new()
 
-  Move-FolderContentsRecursive -SourceFolderServerRelativeUrl $SourceFolderServerRelativeUrl -DestinationFolderServerRelativeUrl $DestinationFolderServerRelativeUrl -Stats $stats -LogRows $logRows -ThrottleDelayMs $ThrottleDelayMs
+  Move-FolderContentsRecursive -SourceFolderServerRelativeUrl $SourceFolderServerRelativeUrl -DestinationFolderServerRelativeUrl $DestinationFolderServerRelativeUrl -Stats $stats -LogRows $logRows -ThrottleDelayMs $ThrottleDelayMs -MoveDuplicateFileandFolders $MoveDuplicateFileandFolders
 
   if (-not [string]::IsNullOrWhiteSpace($LogPath) -and $logRows.Count -gt 0) {
     $logRows | Export-Csv -Path $LogPath -NoTypeInformation
@@ -545,6 +572,7 @@ function Move-LibraryFolderItems {
     Moved      = $stats.Moved
     Renamed    = $stats.Renamed
     Merged     = $stats.Merged
+    Skipped    = $stats.Skipped
     Errors     = $stats.Errors
   }
 }
@@ -592,16 +620,16 @@ try {
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
   }
 
-  $summary = Move-LibraryFolderItems -SourceFolderServerRelativeUrl $sourceFolderServerRelativeUrl -DestinationFolderServerRelativeUrl $destinationFolderServerRelativeUrl -ThrottleDelayMs $ThrottleDelayMs -LogPath $LogPath
+  $summary = Move-LibraryFolderItems -SourceFolderServerRelativeUrl $sourceFolderServerRelativeUrl -DestinationFolderServerRelativeUrl $destinationFolderServerRelativeUrl -ThrottleDelayMs $ThrottleDelayMs -MoveDuplicateFileandFolders $MoveDuplicateFileandFolders -LogPath $LogPath
 
   if ($summary.TotalItems -eq 0) {
     Write-Warn "No items found in the source folder: $sourceSiteRelativeUrl"
   }
   elseif ($summary.Errors -gt 0) {
-    Write-Warn ("Move completed with errors. Items: {0} | Moved: {1} (Renamed for duplicates: {2}, Merged folders: {3}) | Errors: {4} | Log: {5}" -f $summary.TotalItems, $summary.Moved, $summary.Renamed, $summary.Merged, $summary.Errors, $LogPath)
+    Write-Warn ("Move completed with errors. Items: {0} | Moved: {1} (Renamed for duplicates: {2}, Merged folders: {3}) | Skipped duplicates: {4} | Errors: {5} | Log: {6}" -f $summary.TotalItems, $summary.Moved, $summary.Renamed, $summary.Merged, $summary.Skipped, $summary.Errors, $LogPath)
   }
   else {
-    Write-Success ("Move completed. Items: {0} | Moved: {1} (Renamed for duplicates: {2}, Merged folders: {3}) | Log: {4}" -f $summary.TotalItems, $summary.Moved, $summary.Renamed, $summary.Merged, $LogPath)
+    Write-Success ("Move completed. Items: {0} | Moved: {1} (Renamed for duplicates: {2}, Merged folders: {3}) | Skipped duplicates: {4} | Log: {5}" -f $summary.TotalItems, $summary.Moved, $summary.Renamed, $summary.Merged, $summary.Skipped, $LogPath)
   }
 
   # Surface a non-zero exit code so automation/CI can detect partial failures.
