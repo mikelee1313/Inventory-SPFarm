@@ -20,7 +20,7 @@
   - App auth configured with either certificate thumbprint or client secret
   - Admin consent granted for required permissions
 
-.Version 10 - added support for moving duplicate files and folders with the -MoveDuplicateFileandFolders parameter
+.Version 11 - Add options to move direct folder and sub folder and addtional error handling.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -33,10 +33,10 @@ param(
   [string]$DocumentLibrary = 'Shared Documents',
 
   [Parameter()]
-  [string]$SourceFolderPath = 'general/clients',
+  [string]$SourceFolderPath = 'general/clients/w',
 
   [Parameter()]
-  [string]$DestinationFolderPath = 'clients',
+  [string]$DestinationFolderPath = 'clients/w',
 
   [Parameter()]
   [string]$TenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3',
@@ -65,6 +65,9 @@ param(
   [switch]$IncludeSourceFolder = $true,
 
   [Parameter()]
+  [bool]$PauseOnError = $true,
+
+  [Parameter()]
   [int]$ThrottleDelayMs = 0,
 
   [Parameter()]
@@ -74,7 +77,7 @@ param(
   [int]$InitialBackoffSeconds = 2,
 
   [Parameter()]
-  [string]$LogPath = (Join-Path -Path (Get-Location) -ChildPath (
+  [string]$LogPath = (Join-Path -Path $PSScriptRoot -ChildPath (
       "MoveLog_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss')
     ))
 )
@@ -127,6 +130,35 @@ function Write-Warn {
   param([Parameter(Mandatory)] [string]$Message)
 
   Write-Host $Message -ForegroundColor Yellow
+}
+
+function Write-FatalErrorLog {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string]$Path,
+    [Parameter(Mandatory)] [System.Management.Automation.ErrorRecord]$ErrorRecord
+  )
+
+  try {
+    $logDirectory = Split-Path -Path $Path -Parent
+    if (-not [string]::IsNullOrWhiteSpace($logDirectory) -and -not (Test-Path -LiteralPath $logDirectory)) {
+      New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+    }
+
+    [pscustomobject]@{
+      OriginalName = ''
+      MovedAsName  = ''
+      ItemType     = 'Script'
+      Renamed      = $false
+      Status       = 'Failed'
+      Error        = $ErrorRecord.Exception.Message
+    } | Export-Csv -Path $Path -NoTypeInformation -Force
+
+    Write-Warn "Error details written to: $Path"
+  }
+  catch {
+    Write-Warn "Could not write error log '$Path': $($_.Exception.Message)"
+  }
 }
 #endregion Logging Helpers
 
@@ -672,7 +704,11 @@ try {
 }
 catch {
   Write-Warn "Script failed: $($_.Exception.Message)"
+  Write-FatalErrorLog -Path $LogPath -ErrorRecord $_
   try { $host.SetShouldExit(1) } catch { }
+  if ($PauseOnError -and [Environment]::UserInteractive) {
+    [void](Read-Host 'Press Enter to close this window')
+  }
   throw
 }
 finally {
