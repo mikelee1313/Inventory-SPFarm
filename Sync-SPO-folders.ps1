@@ -20,7 +20,7 @@
   - App auth configured with either certificate thumbprint or client secret
   - Admin consent granted for required permissions
 
-.Version 11 - Add options to move direct folder and sub folder and addtional error handling.
+.Version 12 - Add options to move direct folder and sub folder and addtional error handling.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -152,6 +152,15 @@ function Write-FatalErrorLog {
       Renamed      = $false
       Status       = 'Failed'
       Error        = $ErrorRecord.Exception.Message
+      ExceptionType = $ErrorRecord.Exception.GetType().FullName
+      HResult       = $ErrorRecord.Exception.HResult
+      InnerError    = if ($null -ne $ErrorRecord.Exception.InnerException) { $ErrorRecord.Exception.InnerException.Message } else { '' }
+      Category      = [string]$ErrorRecord.CategoryInfo
+      TargetObject  = [string]$ErrorRecord.TargetObject
+      Command       = $ErrorRecord.InvocationInfo.MyCommand.Name
+      ScriptLine    = $ErrorRecord.InvocationInfo.ScriptLineNumber
+      Position      = $ErrorRecord.InvocationInfo.PositionMessage
+      ScriptStack   = $ErrorRecord.ScriptStackTrace
     } | Export-Csv -Path $Path -NoTypeInformation -Force
 
     Write-Warn "Error details written to: $Path"
