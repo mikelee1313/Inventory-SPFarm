@@ -6,6 +6,8 @@
 .DESCRIPTION
   Connects to a SharePoint site using PnP.PowerShell and moves every file and folder found
   directly inside a source folder into a destination folder in the same document library.
+  Use -IncludeSourceFolder to preserve the selected source folder as a folder beneath the
+  destination (for example, moving Sagebrush Software into clients/s/Sagebrush Software).
   If an item with the same name already exists at the destination, behaviour depends on
   the -MoveDuplicateFileandFolders parameter. When $true (default) the moved item is renamed by
   appending an incrementing number (e.g. Report.docx -> Report1.docx) so that no existing
@@ -31,10 +33,10 @@ param(
   [string]$DocumentLibrary = 'Shared Documents',
 
   [Parameter()]
-  [string]$SourceFolderPath = 'general/clients/j',
+  [string]$SourceFolderPath = 'general/clients/u/Urban Vale Networks',
 
   [Parameter()]
-  [string]$DestinationFolderPath = 'clients/j',
+  [string]$DestinationFolderPath = 'clients/u',
 
   [Parameter()]
   [string]$TenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3',
@@ -58,6 +60,9 @@ param(
 
   [Parameter()]
   [bool]$MoveDuplicateFileandFolders = $false,
+
+  [Parameter()]
+  [switch]$IncludeSourceFolder = $true,
 
   [Parameter()]
   [int]$ThrottleDelayMs = 0,
@@ -555,6 +560,7 @@ function Move-LibraryFolderItems {
     [Parameter(Mandatory)] [string]$DestinationFolderServerRelativeUrl,
     [Parameter()] [int]$ThrottleDelayMs = 0,
     [Parameter()] [bool]$MoveDuplicateFileandFolders = $true,
+    [Parameter()] [switch]$RemoveSourceRootAfterMove,
     [Parameter()] [string]$LogPath
   )
 
@@ -562,6 +568,24 @@ function Move-LibraryFolderItems {
   $logRows = [System.Collections.Generic.List[object]]::new()
 
   Move-FolderContentsRecursive -SourceFolderServerRelativeUrl $SourceFolderServerRelativeUrl -DestinationFolderServerRelativeUrl $DestinationFolderServerRelativeUrl -Stats $stats -LogRows $logRows -ThrottleDelayMs $ThrottleDelayMs -MoveDuplicateFileandFolders $MoveDuplicateFileandFolders
+
+  if ($RemoveSourceRootAfterMove -and $stats.Errors -eq 0 -and $stats.Skipped -eq 0) {
+    $sourceFolderUrl = $SourceFolderServerRelativeUrl.TrimEnd('/')
+    $sourceFolderName = $sourceFolderUrl.Substring($sourceFolderUrl.LastIndexOf('/') + 1)
+    $sourceParentUrl = $sourceFolderUrl.Substring(0, $sourceFolderUrl.LastIndexOf('/'))
+
+    if ($PSCmdlet.ShouldProcess($sourceFolderUrl, 'Remove now-empty source root folder')) {
+      try {
+        Invoke-PnPWithRetry { Remove-PnPFolder -Name $sourceFolderName -Folder $sourceParentUrl -Recycle -Force -ErrorAction Stop } | Out-Null
+        $logRows.Add([pscustomobject]@{ OriginalName = $sourceFolderName; MovedAsName = $sourceFolderName; ItemType = 'Folder (root)'; Renamed = $false; Status = 'Success'; Error = '' })
+      }
+      catch {
+        $stats.Errors++
+        Write-Warn "Failed to remove empty source root folder '$sourceFolderName': $($_.Exception.Message)"
+        $logRows.Add([pscustomobject]@{ OriginalName = $sourceFolderName; MovedAsName = $sourceFolderName; ItemType = 'Folder (root)'; Renamed = $false; Status = 'Failed'; Error = $_.Exception.Message })
+      }
+    }
+  }
 
   if (-not [string]::IsNullOrWhiteSpace($LogPath) -and $logRows.Count -gt 0) {
     $logRows | Export-Csv -Path $LogPath -NoTypeInformation
@@ -589,14 +613,23 @@ try {
   $libraryContext = Resolve-DocumentLibraryContext -LibraryInput $DocumentLibrary -FallbackSiteUrl $SiteUrl
   Connect-ToPnPSite -Url $libraryContext.SiteUrl
 
-  $libraryName = Get-ResolvedLibraryName -LibraryInput $DocumentLibrary
+  [void](Get-ResolvedLibraryName -LibraryInput $DocumentLibrary)
   $libraryRelativeUrl = $libraryContext.LibrarySiteRelativePath.Trim('/')
 
   $web = Invoke-PnPWithRetry { Get-PnPWeb -Includes ServerRelativeUrl }
   $siteServerRelativeUrl = $web.ServerRelativeUrl.TrimEnd('/')
 
   $sourceSiteRelativeUrl = ("{0}/{1}" -f $libraryRelativeUrl, $SourceFolderPath.Trim('/')).Trim('/')
-  $destinationSiteRelativeUrl = ("{0}/{1}" -f $libraryRelativeUrl, $DestinationFolderPath.Trim('/')).Trim('/')
+  $destinationBaseSiteRelativeUrl = ("{0}/{1}" -f $libraryRelativeUrl, $DestinationFolderPath.Trim('/')).Trim('/')
+  $sourceFolderName = ($SourceFolderPath.Trim('/') -split '/')[-1]
+  $destinationFolderName = ($DestinationFolderPath.Trim('/') -split '/')[-1]
+  $destinationAlreadyIncludesSourceFolder = $destinationFolderName.Equals($sourceFolderName, [StringComparison]::OrdinalIgnoreCase)
+  $destinationSiteRelativeUrl = if ($IncludeSourceFolder -and -not $destinationAlreadyIncludesSourceFolder) {
+    "$destinationBaseSiteRelativeUrl/$sourceFolderName"
+  }
+  else {
+    $destinationBaseSiteRelativeUrl
+  }
 
   # Guard against the destination being the same as, or nested inside, the source (would corrupt/duplicate content).
   if ($destinationSiteRelativeUrl -eq $sourceSiteRelativeUrl -or
@@ -620,7 +653,7 @@ try {
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
   }
 
-  $summary = Move-LibraryFolderItems -SourceFolderServerRelativeUrl $sourceFolderServerRelativeUrl -DestinationFolderServerRelativeUrl $destinationFolderServerRelativeUrl -ThrottleDelayMs $ThrottleDelayMs -MoveDuplicateFileandFolders $MoveDuplicateFileandFolders -LogPath $LogPath
+  $summary = Move-LibraryFolderItems -SourceFolderServerRelativeUrl $sourceFolderServerRelativeUrl -DestinationFolderServerRelativeUrl $destinationFolderServerRelativeUrl -ThrottleDelayMs $ThrottleDelayMs -MoveDuplicateFileandFolders $MoveDuplicateFileandFolders -RemoveSourceRootAfterMove:$IncludeSourceFolder -LogPath $LogPath
 
   if ($summary.TotalItems -eq 0) {
     Write-Warn "No items found in the source folder: $sourceSiteRelativeUrl"
