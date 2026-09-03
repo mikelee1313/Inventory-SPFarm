@@ -33,10 +33,10 @@ param(
   [string]$DocumentLibrary = 'Shared Documents',
 
   [Parameter()]
-  [string]$SourceFolderPath = 'general/clients/u/Urban Vale Networks',
+  [string]$SourceFolderPath = 'general/clients',
 
   [Parameter()]
-  [string]$DestinationFolderPath = 'clients/u',
+  [string]$DestinationFolderPath = 'clients',
 
   [Parameter()]
   [string]$TenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3',
