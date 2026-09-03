@@ -8,6 +8,10 @@
   directly inside a source folder into a destination folder in the same document library.
   Use -IncludeSourceFolder to preserve the selected source folder as a folder beneath the
   destination (for example, moving Sagebrush Software into clients/s/Sagebrush Software).
+  Use -RemoveSourceFolder to additionally delete the now-empty source folder (to the recycle
+  bin) once every item beneath it has moved successfully. This is independent of
+  -IncludeSourceFolder and defaults to $false, so a run never deletes a source folder unless
+  explicitly asked to.
   If an item with the same name already exists at the destination, behaviour depends on
   the -MoveDuplicateFileandFolders parameter. When $true (default) the moved item is renamed by
   appending an incrementing number (e.g. Report.docx -> Report1.docx) so that no existing
@@ -20,7 +24,15 @@
   - App auth configured with either certificate thumbprint or client secret
   - Admin consent granted for required permissions
 
-.Version 12 - Add options to move direct folder and sub folder and addtional error handling.
+.NOTES
+  -PauseOnError defaults to $true for interactive testing. Scheduled tasks and other
+  unattended invocations must pass -PauseOnError:$false, since a console without an
+  attached interactive session will otherwise still attempt to prompt.
+
+.Version 14 - Fixed destination path creation to walk from the web root instead of the full
+  server-relative URL; broadened the 5000-item bug detection to match any folder cmdlet instead
+  of only Resolve-PnPFolder; folder existence checks now only treat genuine not-found errors as
+  missing, so unrelated failures (throttling, permissions) surface instead of being masked.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -33,10 +45,10 @@ param(
   [string]$DocumentLibrary = 'Shared Documents',
 
   [Parameter()]
-  [string]$SourceFolderPath = 'general/clients/w',
+  [string]$SourceFolderPath = 'general/clients',
 
   [Parameter()]
-  [string]$DestinationFolderPath = 'clients/w',
+  [string]$DestinationFolderPath = 'clients',
 
   [Parameter()]
   [string]$TenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3',
@@ -63,6 +75,9 @@ param(
 
   [Parameter()]
   [switch]$IncludeSourceFolder = $true,
+
+  [Parameter()]
+  [switch]$RemoveSourceFolder,
 
   [Parameter()]
   [bool]$PauseOnError = $true,
@@ -136,7 +151,8 @@ function Write-FatalErrorLog {
   [CmdletBinding()]
   param(
     [Parameter(Mandatory)] [string]$Path,
-    [Parameter(Mandatory)] [System.Management.Automation.ErrorRecord]$ErrorRecord
+    [Parameter(Mandatory)] [System.Management.Automation.ErrorRecord]$ErrorRecord,
+    [Parameter()] [string]$Guidance = ''
   )
 
   try {
@@ -152,6 +168,7 @@ function Write-FatalErrorLog {
       Renamed      = $false
       Status       = 'Failed'
       Error        = $ErrorRecord.Exception.Message
+      Guidance      = $Guidance
       ExceptionType = $ErrorRecord.Exception.GetType().FullName
       HResult       = $ErrorRecord.Exception.HResult
       InnerError    = if ($null -ne $ErrorRecord.Exception.InnerException) { $ErrorRecord.Exception.InnerException.Message } else { '' }
@@ -168,6 +185,17 @@ function Write-FatalErrorLog {
   catch {
     Write-Warn "Could not write error log '$Path': $($_.Exception.Message)"
   }
+}
+
+function Test-PnPFolderThresholdBug {
+  # PnP.PowerShell < 3.2.0 has a bug (fixed in #5411) originally seen in Resolve-PnPFolder where a
+  # generic "Exception from HRESULT: 0x87FA0080" is thrown on libraries with more than 5000 items.
+  # Match on the HResult/message alone rather than the command name, since the same underlying
+  # SharePoint failure can surface through other folder cmdlets (e.g. Get-PnPFolder, Add-PnPFolder).
+  [CmdletBinding()]
+  param([Parameter(Mandatory)] [System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+  return ($ErrorRecord.Exception.HResult -eq -2013659008) -or ($ErrorRecord.Exception.Message -match '0x87FA0080')
 }
 #endregion Logging Helpers
 
@@ -407,6 +435,46 @@ function Get-ResolvedLibraryName {
   return $libraryList.Title
 }
 #endregion Item Metadata Helpers
+
+#region Folder Path Creation
+function New-PnPFolderPathIfMissing {
+  # Resolve-PnPFolder can throw a generic HRESULT 0x87FA0080 exception on libraries with
+  # more than 5000 items, so create any missing segments directly instead.
+  [CmdletBinding(SupportsShouldProcess)]
+  param(
+    [Parameter(Mandatory)] [string]$WebServerRelativeUrl,
+    [Parameter(Mandatory)] [string]$SiteRelativePath
+  )
+
+  $segments = @($SiteRelativePath.Trim('/') -split '/' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  if ($segments.Count -eq 0) {
+    throw "SiteRelativePath '$SiteRelativePath' does not contain any folder segments."
+  }
+
+  $currentPath = $WebServerRelativeUrl.TrimEnd('/')
+  foreach ($segment in $segments) {
+    $parentPath = $currentPath
+    $currentPath = "$currentPath/$segment"
+
+    $exists = $true
+    try {
+      Invoke-PnPWithRetry { Get-PnPFolder -Url $currentPath -ErrorAction Stop } | Out-Null
+    }
+    catch {
+      # Only treat a genuine not-found as "missing"; rethrow anything else (throttling,
+      # permissions, etc.) so the real cause surfaces instead of a confusing Add-PnPFolder failure.
+      $looksLikeNotFound = $_.Exception.Message -match '(File Not Found|does not exist|404)' -or
+        $_.CategoryInfo.Category -eq 'ObjectNotFound'
+      if (-not $looksLikeNotFound) { throw }
+      $exists = $false
+    }
+
+    if (-not $exists -and $PSCmdlet.ShouldProcess($currentPath, 'Create folder')) {
+      Invoke-PnPWithRetry { Add-PnPFolder -Name $segment -Folder $parentPath -ErrorAction Stop } | Out-Null
+    }
+  }
+}
+#endregion Folder Path Creation
 
 #region Move Operations
 function Get-PnPFolderChildNames {
@@ -651,6 +719,15 @@ try {
 
   Import-Module PnP.PowerShell -ErrorAction Stop
 
+  $pnpModule = Get-Module -Name PnP.PowerShell
+  $minimumSupportedVersion = [version]'3.2.0'
+  if ($pnpModule.Version -lt $minimumSupportedVersion) {
+    $versionWarningTemplate = 'PnP.PowerShell {0} is older than {1}. Versions before {1} contain a known bug where ' +
+      "folder cmdlets fail with 'Exception from HRESULT: 0x87FA0080' on libraries with more than " +
+      '5000 items. Run: Update-Module PnP.PowerShell'
+    Write-Warn ($versionWarningTemplate -f $pnpModule.Version, $minimumSupportedVersion)
+  }
+
   $libraryContext = Resolve-DocumentLibraryContext -LibraryInput $DocumentLibrary -FallbackSiteUrl $SiteUrl
   Connect-ToPnPSite -Url $libraryContext.SiteUrl
 
@@ -682,19 +759,19 @@ try {
   Write-Info "Source folder: $sourceSiteRelativeUrl"
   Write-Info "Destination folder: $destinationSiteRelativeUrl"
 
-  # Fail fast if the source doesn't exist; create the destination if it's missing.
-  Invoke-PnPWithRetry { Get-PnPFolder -Url $sourceSiteRelativeUrl -ErrorAction Stop } | Out-Null
-  Invoke-PnPWithRetry { Resolve-PnPFolder -SiteRelativePath $destinationSiteRelativeUrl -ErrorAction Stop } | Out-Null
-
   $sourceFolderServerRelativeUrl = "$siteServerRelativeUrl/$sourceSiteRelativeUrl"
   $destinationFolderServerRelativeUrl = "$siteServerRelativeUrl/$destinationSiteRelativeUrl"
+
+  # Fail fast if the source doesn't exist; create the destination if it's missing.
+  Invoke-PnPWithRetry { Get-PnPFolder -Url $sourceFolderServerRelativeUrl -ErrorAction Stop } | Out-Null
+  New-PnPFolderPathIfMissing -WebServerRelativeUrl $siteServerRelativeUrl -SiteRelativePath $destinationSiteRelativeUrl
 
   $logDirectory = Split-Path -Path $LogPath -Parent
   if (-not [string]::IsNullOrWhiteSpace($logDirectory) -and -not (Test-Path -Path $logDirectory)) {
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
   }
 
-  $summary = Move-LibraryFolderItems -SourceFolderServerRelativeUrl $sourceFolderServerRelativeUrl -DestinationFolderServerRelativeUrl $destinationFolderServerRelativeUrl -ThrottleDelayMs $ThrottleDelayMs -MoveDuplicateFileandFolders $MoveDuplicateFileandFolders -RemoveSourceRootAfterMove:$IncludeSourceFolder -LogPath $LogPath
+  $summary = Move-LibraryFolderItems -SourceFolderServerRelativeUrl $sourceFolderServerRelativeUrl -DestinationFolderServerRelativeUrl $destinationFolderServerRelativeUrl -ThrottleDelayMs $ThrottleDelayMs -MoveDuplicateFileandFolders $MoveDuplicateFileandFolders -RemoveSourceRootAfterMove:$RemoveSourceFolder -LogPath $LogPath
 
   if ($summary.TotalItems -eq 0) {
     Write-Warn "No items found in the source folder: $sourceSiteRelativeUrl"
@@ -713,10 +790,22 @@ try {
 }
 catch {
   Write-Warn "Script failed: $($_.Exception.Message)"
-  Write-FatalErrorLog -Path $LogPath -ErrorRecord $_
+  $guidance = ''
+  if (Test-PnPFolderThresholdBug -ErrorRecord $_) {
+    $guidance = "Known PnP.PowerShell bug (fixed in 3.2.0, issue #5411): folder cmdlets fail with this " +
+      "generic HRESULT on document libraries containing more than 5000 items. Run 'Update-Module " +
+      "PnP.PowerShell' to install 3.2.0 or later, then retry."
+    Write-Warn $guidance
+  }
+  Write-FatalErrorLog -Path $LogPath -ErrorRecord $_ -Guidance $guidance
   try { $host.SetShouldExit(1) } catch { }
-  if ($PauseOnError -and [Environment]::UserInteractive) {
-    [void](Read-Host 'Press Enter to close this window')
+  if ($PauseOnError) {
+    # Guards against hanging under Task Scheduler or other consoles with no attached input.
+    $canPromptInteractively = $false
+    try { $canPromptInteractively = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected } catch { $canPromptInteractively = $false }
+    if ($canPromptInteractively) {
+      [void](Read-Host 'Press Enter to close this window')
+    }
   }
   throw
 }
