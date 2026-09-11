@@ -508,7 +508,7 @@ function Get-UniqueItemName {
   param(
     [Parameter(Mandatory)] [string]$Name,
     [Parameter(Mandatory)] [bool]$IsFolder,
-    [Parameter(Mandatory)] [System.Collections.Generic.HashSet[string]]$ExistingNames
+    [Parameter(Mandatory)] [AllowEmptyCollection()] [System.Collections.Generic.HashSet[string]]$ExistingNames
   )
 
   if (-not $ExistingNames.Contains($Name)) { return $Name }
