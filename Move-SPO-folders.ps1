@@ -44,6 +44,9 @@
 .Version 17
 - Added Remove-PnPFolderWithRetry helper to handle SharePoint Online indexing delays when removing now-empty source folders after merging. Resolves "You have to delete all the items in this folder before you can delete the folder" errors.
 
+.Version 18
+- Added CSOM ListItemAllFields.Recycle() fallback in Remove-PnPFolderWithRetry to bypass SharePoint Online's stale Folder.ItemCount property after Move-PnPFile operations.
+
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -56,10 +59,10 @@ param(
   [string]$DocumentLibrary = 'Shared Documents',
 
   [Parameter()]
-  [string]$SourceFolderPath = 'general/clients/v',
+  [string]$SourceFolderPath = 'general/clients/u',
 
   [Parameter()]
-  [string]$DestinationFolderPath = 'clients/v',
+  [string]$DestinationFolderPath = 'clients/u',
 
   [Parameter()]
   [string]$TenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3',
@@ -582,11 +585,62 @@ function Remove-PnPFolderWithRetry {
         }
       }
 
-      # Attempt folder removal
-      Invoke-PnPWithRetry {
-        Remove-PnPFolder -Name $Name -Folder $FolderServerRelativeUrl -Recycle -Force -ErrorAction Stop
-      } | Out-Null
-      return
+      # Primary attempt: Standard Remove-PnPFolder cmdlet
+      try {
+        Invoke-PnPWithRetry {
+          Remove-PnPFolder -Name $Name -Folder $FolderServerRelativeUrl -Recycle -Force -ErrorAction Stop
+        } | Out-Null
+        return
+      }
+      catch {
+        $msg = $_.Exception.Message
+        $looksNotFound = $msg -match '(File Not Found|does not exist|404)' -or
+          $_.CategoryInfo.Category -eq 'ObjectNotFound'
+        if ($looksNotFound) {
+          return
+        }
+
+        $isFolderNotEmptyError = $msg -match '(delete all the items|not empty|directory is not empty)'
+        if ($isFolderNotEmptyError) {
+          # Move-PnPFile leaves a stale ItemCount on the SP.Folder object in SPO,
+          # which causes Remove-PnPFolder (SP.Folder.Recycle) to fail with "delete all the items".
+          # Fallback: Delete/recycle via the folder's ListItemAllFields CSOM object, which bypasses
+          # the stale SP.Folder.ItemCount property check and successfully recycles the folder item.
+          Write-Warn "Folder '$Name' triggered SPO stale ItemCount block. Attempting fallback removal via ListItemAllFields..."
+          try {
+            Invoke-PnPWithRetry {
+              $ctx = Get-PnPContext
+              $folderObj = Get-PnPFolder -Url $targetFolderUrl -Includes ListItemAllFields -ErrorAction Stop
+              if ($null -ne $folderObj -and $null -ne $folderObj.ListItemAllFields -and $folderObj.ListItemAllFields.ServerObjectNullPadd -ne $true) {
+                $folderObj.ListItemAllFields.Recycle() | Out-Null
+                $ctx.ExecuteQuery()
+                return $true
+              }
+              return $false
+            } | Out-Null
+            Write-Info "Successfully recycled folder '$Name' via ListItemAllFields."
+            return
+          }
+          catch {
+            $fallbackMsg = $_.Exception.Message
+            $fallbackNotFound = $fallbackMsg -match '(File Not Found|does not exist|404)' -or
+              $_.CategoryInfo.Category -eq 'ObjectNotFound'
+            if ($fallbackNotFound) {
+              return
+            }
+
+            if ($attempt -lt $MaxRetries) {
+              Write-Warn "Fallback removal for '$Name' failed ('$fallbackMsg'). Waiting ${DelaySeconds}s before retry (attempt $attempt/$MaxRetries)..."
+              Start-Sleep -Seconds $DelaySeconds
+              continue
+            }
+            throw "Failed to remove folder '$Name': $fallbackMsg"
+          }
+        }
+        else {
+          throw
+        }
+      }
     }
     catch {
       $msg = $_.Exception.Message
@@ -595,14 +649,9 @@ function Remove-PnPFolderWithRetry {
       if ($looksNotFound) {
         return
       }
-
-      $isFolderNotEmptyError = $msg -match '(delete all the items|not empty|directory is not empty)'
-      if ($isFolderNotEmptyError -and $attempt -lt $MaxRetries) {
-        Write-Warn "SPO reported folder '$Name' not ready for deletion ('$msg'). Waiting ${DelaySeconds}s before retry (attempt $attempt/$MaxRetries)..."
-        Start-Sleep -Seconds $DelaySeconds
-        continue
+      if ($attempt -eq $MaxRetries) {
+        throw
       }
-      throw
     }
   }
 }
