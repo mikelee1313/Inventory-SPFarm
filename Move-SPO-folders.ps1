@@ -33,6 +33,9 @@
   server-relative URL; broadened the 5000-item bug detection to match any folder cmdlet instead
   of only Resolve-PnPFolder; folder existence checks now only treat genuine not-found errors as
   missing, so unrelated failures (throttling, permissions) surface instead of being masked.
+
+.Version 15 - Fixed issues with logging by adding SourceUrl and TargetUrl fields to better track moved items and 
+  resolved bug with null values $ExistingNames for the SourceUrl and TargetUrl fields.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -74,7 +77,7 @@ param(
   [bool]$MoveDuplicateFileandFolders = $false,
 
   [Parameter()]
-  [switch]$IncludeSourceFolder = $true,
+  [bool]$IncludeSourceFolder = $true,
 
   [Parameter()]
   [switch]$RemoveSourceFolder,
@@ -162,12 +165,14 @@ function Write-FatalErrorLog {
     }
 
     [pscustomobject]@{
-      OriginalName = ''
-      MovedAsName  = ''
-      ItemType     = 'Script'
-      Renamed      = $false
-      Status       = 'Failed'
-      Error        = $ErrorRecord.Exception.Message
+      OriginalName  = ''
+      MovedAsName   = ''
+      SourceUrl     = ''
+      TargetUrl     = ''
+      ItemType      = 'Script'
+      Renamed       = $false
+      Status        = 'Failed'
+      Error         = $ErrorRecord.Exception.Message
       Guidance      = $Guidance
       ExceptionType = $ErrorRecord.Exception.GetType().FullName
       HResult       = $ErrorRecord.Exception.HResult
@@ -557,7 +562,7 @@ function Move-FolderContentsRecursive {
       if (-not $MoveDuplicateFileandFolders) {
         $Stats.Skipped++
         Write-Warn "Duplicate folder found. Skipped '$name'; left in source folder."
-        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = ''; ItemType = 'Folder'; Renamed = $false; Status = 'Skipped'; Error = 'Duplicate name at destination; MoveDuplicateFileandFolders is false.' })
+        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = ''; SourceUrl = $sourceUrl; TargetUrl = ''; ItemType = 'Folder'; Renamed = $false; Status = 'Skipped'; Error = 'Duplicate name at destination; MoveDuplicateFileandFolders is false.' })
         continue
       }
 
@@ -572,22 +577,22 @@ function Move-FolderContentsRecursive {
       # left behind; otherwise deleting the folder would send those items to the recycle bin.
       if ($Stats.Errors -gt $errorsBeforeMerge) {
         Write-Warn "Skipping removal of source folder '$name': one or more nested items failed to move."
-        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; ItemType = 'Folder (merged)'; Renamed = $false; Status = 'Skipped'; Error = 'Nested item(s) failed to move; source folder retained.' })
+        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; SourceUrl = $sourceUrl; TargetUrl = $destChildUrl; ItemType = 'Folder (merged)'; Renamed = $false; Status = 'Skipped'; Error = 'Nested item(s) failed to move; source folder retained.' })
       }
       elseif ($Stats.Skipped -gt $skippedBeforeMerge) {
         Write-Warn "Skipping removal of source folder '$name': duplicate item(s) were retained in the source."
-        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; ItemType = 'Folder (merged)'; Renamed = $false; Status = 'Skipped'; Error = 'Duplicate item(s) retained in source; source folder retained.' })
+        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; SourceUrl = $sourceUrl; TargetUrl = $destChildUrl; ItemType = 'Folder (merged)'; Renamed = $false; Status = 'Skipped'; Error = 'Duplicate item(s) retained in source; source folder retained.' })
       }
       elseif ($PSCmdlet.ShouldProcess($sourceUrl, "Remove now-empty source folder after merge")) {
         try {
           Invoke-PnPWithRetry { Remove-PnPFolder -Name $name -Folder $SourceFolderServerRelativeUrl -Recycle -Force -ErrorAction Stop } | Out-Null
           $Stats.Merged++
-          $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; ItemType = 'Folder (merged)'; Renamed = $false; Status = 'Success'; Error = '' })
+          $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; SourceUrl = $sourceUrl; TargetUrl = $destChildUrl; ItemType = 'Folder (merged)'; Renamed = $false; Status = 'Success'; Error = '' })
         }
         catch {
           $Stats.Errors++
           Write-Warn "Failed to remove empty source folder '$name' after merge: $($_.Exception.Message)"
-          $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; ItemType = 'Folder (merged)'; Renamed = $false; Status = 'Failed'; Error = $_.Exception.Message })
+          $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; SourceUrl = $sourceUrl; TargetUrl = $destChildUrl; ItemType = 'Folder (merged)'; Renamed = $false; Status = 'Failed'; Error = $_.Exception.Message })
         }
       }
     }
@@ -601,12 +606,12 @@ function Move-FolderContentsRecursive {
         [void]$destinationFolderNames.Add($name)
         $Stats.Moved++
         Write-Info "Moved folder '$name'."
-        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; ItemType = 'Folder'; Renamed = $false; Status = 'Success'; Error = '' })
+        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; SourceUrl = $sourceUrl; TargetUrl = $targetUrl; ItemType = 'Folder'; Renamed = $false; Status = 'Success'; Error = '' })
       }
       catch {
         $Stats.Errors++
         Write-Warn "Failed to move folder '$name': $($_.Exception.Message)"
-        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; ItemType = 'Folder'; Renamed = $false; Status = 'Failed'; Error = $_.Exception.Message })
+        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; SourceUrl = $sourceUrl; TargetUrl = $targetUrl; ItemType = 'Folder'; Renamed = $false; Status = 'Failed'; Error = $_.Exception.Message })
       }
     }
 
@@ -622,7 +627,7 @@ function Move-FolderContentsRecursive {
     if (-not $MoveDuplicateFileandFolders -and $destinationNames.Contains($originalName)) {
       $Stats.Skipped++
       Write-Warn "Duplicate found. Skipped '$originalName'; left in source folder."
-      $LogRows.Add([pscustomobject]@{ OriginalName = $originalName; MovedAsName = ''; ItemType = 'File'; Renamed = $false; Status = 'Skipped'; Error = 'Duplicate name at destination; MoveDuplicateFileandFolders is false.' })
+      $LogRows.Add([pscustomobject]@{ OriginalName = $originalName; MovedAsName = ''; SourceUrl = "$SourceFolderServerRelativeUrl/$originalName"; TargetUrl = ''; ItemType = 'File'; Renamed = $false; Status = 'Skipped'; Error = 'Duplicate name at destination; MoveDuplicateFileandFolders is false.' })
       continue
     }
 
@@ -648,12 +653,12 @@ function Move-FolderContentsRecursive {
         Write-Info "Moved '$originalName'."
       }
 
-      $LogRows.Add([pscustomobject]@{ OriginalName = $originalName; MovedAsName = $uniqueName; ItemType = 'File'; Renamed = $wasRenamed; Status = 'Success'; Error = '' })
+      $LogRows.Add([pscustomobject]@{ OriginalName = $originalName; MovedAsName = $uniqueName; SourceUrl = $sourceUrl; TargetUrl = $targetUrl; ItemType = 'File'; Renamed = $wasRenamed; Status = 'Success'; Error = '' })
     }
     catch {
       $Stats.Errors++
       Write-Warn "Failed to move '$originalName': $($_.Exception.Message)"
-      $LogRows.Add([pscustomobject]@{ OriginalName = $originalName; MovedAsName = $uniqueName; ItemType = 'File'; Renamed = $wasRenamed; Status = 'Failed'; Error = $_.Exception.Message })
+      $LogRows.Add([pscustomobject]@{ OriginalName = $originalName; MovedAsName = $uniqueName; SourceUrl = $sourceUrl; TargetUrl = $targetUrl; ItemType = 'File'; Renamed = $wasRenamed; Status = 'Failed'; Error = $_.Exception.Message })
     }
 
     if ($ThrottleDelayMs -gt 0) {
@@ -686,12 +691,12 @@ function Move-LibraryFolderItems {
     if ($PSCmdlet.ShouldProcess($sourceFolderUrl, 'Remove now-empty source root folder')) {
       try {
         Invoke-PnPWithRetry { Remove-PnPFolder -Name $sourceFolderName -Folder $sourceParentUrl -Recycle -Force -ErrorAction Stop } | Out-Null
-        $logRows.Add([pscustomobject]@{ OriginalName = $sourceFolderName; MovedAsName = $sourceFolderName; ItemType = 'Folder (root)'; Renamed = $false; Status = 'Success'; Error = '' })
+        $logRows.Add([pscustomobject]@{ OriginalName = $sourceFolderName; MovedAsName = $sourceFolderName; SourceUrl = $sourceFolderUrl; TargetUrl = ''; ItemType = 'Folder (root)'; Renamed = $false; Status = 'Success'; Error = '' })
       }
       catch {
         $stats.Errors++
         Write-Warn "Failed to remove empty source root folder '$sourceFolderName': $($_.Exception.Message)"
-        $logRows.Add([pscustomobject]@{ OriginalName = $sourceFolderName; MovedAsName = $sourceFolderName; ItemType = 'Folder (root)'; Renamed = $false; Status = 'Failed'; Error = $_.Exception.Message })
+        $logRows.Add([pscustomobject]@{ OriginalName = $sourceFolderName; MovedAsName = $sourceFolderName; SourceUrl = $sourceFolderUrl; TargetUrl = ''; ItemType = 'Folder (root)'; Renamed = $false; Status = 'Failed'; Error = $_.Exception.Message })
       }
     }
   }
