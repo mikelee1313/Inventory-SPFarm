@@ -14,7 +14,7 @@
   explicitly asked to.
   If an item with the same name already exists at the destination, behaviour depends on
   the -MoveDuplicateFileandFolders parameter. When $true (default) the moved item is renamed by
-  appending an incrementing number (e.g. Report.docx -> Report1.docx) so that no existing
+  appending an underscore and an incrementing number (e.g. Report.docx -> Report_1.docx) so that no existing
   content is overwritten, and same-named folders are merged. When $false the duplicate file
   or folder is skipped entirely and left in the source location.
 
@@ -41,6 +41,9 @@
 .Version 16
 - Fixed issue with folder moves where the target URL was incorrectly specified, causing failures when moving folders.
 
+.Version 17
+- Added Remove-PnPFolderWithRetry helper to handle SharePoint Online indexing delays when removing now-empty source folders after merging. Resolves "You have to delete all the items in this folder before you can delete the folder" errors.
+
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -53,10 +56,10 @@ param(
   [string]$DocumentLibrary = 'Shared Documents',
 
   [Parameter()]
-  [string]$SourceFolderPath = 'general/clients/w',
+  [string]$SourceFolderPath = 'general/clients/v',
 
   [Parameter()]
-  [string]$DestinationFolderPath = 'clients/w',
+  [string]$DestinationFolderPath = 'clients/v',
 
   [Parameter()]
   [string]$TenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3',
@@ -79,7 +82,7 @@ param(
   [string]$ClientSecret = $env:PNP_CLIENT_SECRET,
 
   [Parameter()]
-  [bool]$MoveDuplicateFileandFolders = $false,
+  [bool]$MoveDuplicateFileandFolders = $true,
 
   [Parameter()]
   [bool]$IncludeSourceFolder = $true,
@@ -534,11 +537,74 @@ function Get-UniqueItemName {
 
   $counter = 1
   do {
-    $candidate = "{0}{1}{2}" -f $baseName, $counter, $extension
+    $candidate = "{0}_{1}{2}" -f $baseName, $counter, $extension
     $counter++
   } while ($ExistingNames.Contains($candidate))
 
   return $candidate
+}
+
+function Remove-PnPFolderWithRetry {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)] [string]$Name,
+    [Parameter(Mandatory)] [string]$FolderServerRelativeUrl,
+    [Parameter()] [int]$MaxRetries = 5,
+    [Parameter()] [int]$DelaySeconds = 2
+  )
+
+  $targetFolderUrl = "$($FolderServerRelativeUrl.TrimEnd('/'))/$Name"
+
+  for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+    try {
+      # Verify whether any items remain in the source folder according to SPO
+      $remaining = $null
+      try {
+        $remaining = Get-PnPFolderChildNames -FolderServerRelativeUrl $targetFolderUrl
+      }
+      catch {
+        $looksNotFound = $_.Exception.Message -match '(File Not Found|does not exist|404)' -or
+          $_.CategoryInfo.Category -eq 'ObjectNotFound'
+        if ($looksNotFound) {
+          return
+        }
+        throw
+      }
+
+      if ($remaining.Files.Count -gt 0 -or $remaining.Folders.Count -gt 0) {
+        if ($attempt -lt $MaxRetries) {
+          Write-Warn "Folder '$Name' still reports $($remaining.Files.Count) file(s) and $($remaining.Folders.Count) folder(s) remaining (SPO indexing delay). Waiting ${DelaySeconds}s before retry (attempt $attempt/$MaxRetries)..."
+          Start-Sleep -Seconds $DelaySeconds
+          continue
+        }
+        else {
+          throw "Folder '$Name' is not empty ($($remaining.Files.Count) file(s), $($remaining.Folders.Count) folder(s) remain)."
+        }
+      }
+
+      # Attempt folder removal
+      Invoke-PnPWithRetry {
+        Remove-PnPFolder -Name $Name -Folder $FolderServerRelativeUrl -Recycle -Force -ErrorAction Stop
+      } | Out-Null
+      return
+    }
+    catch {
+      $msg = $_.Exception.Message
+      $looksNotFound = $msg -match '(File Not Found|does not exist|404)' -or
+        $_.CategoryInfo.Category -eq 'ObjectNotFound'
+      if ($looksNotFound) {
+        return
+      }
+
+      $isFolderNotEmptyError = $msg -match '(delete all the items|not empty|directory is not empty)'
+      if ($isFolderNotEmptyError -and $attempt -lt $MaxRetries) {
+        Write-Warn "SPO reported folder '$Name' not ready for deletion ('$msg'). Waiting ${DelaySeconds}s before retry (attempt $attempt/$MaxRetries)..."
+        Start-Sleep -Seconds $DelaySeconds
+        continue
+      }
+      throw
+    }
+  }
 }
 
 function Move-FolderContentsRecursive {
@@ -590,7 +656,7 @@ function Move-FolderContentsRecursive {
       }
       elseif ($PSCmdlet.ShouldProcess($sourceUrl, "Remove now-empty source folder after merge")) {
         try {
-          Invoke-PnPWithRetry { Remove-PnPFolder -Name $name -Folder $SourceFolderServerRelativeUrl -Recycle -Force -ErrorAction Stop } | Out-Null
+          Remove-PnPFolderWithRetry -Name $name -FolderServerRelativeUrl $SourceFolderServerRelativeUrl
           $Stats.Merged++
           $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; SourceUrl = $sourceUrl; TargetUrl = $destChildUrl; ItemType = 'Folder (merged)'; Renamed = $false; Status = 'Success'; Error = '' })
         }
@@ -696,7 +762,7 @@ function Move-LibraryFolderItems {
 
     if ($PSCmdlet.ShouldProcess($sourceFolderUrl, 'Remove now-empty source root folder')) {
       try {
-        Invoke-PnPWithRetry { Remove-PnPFolder -Name $sourceFolderName -Folder $sourceParentUrl -Recycle -Force -ErrorAction Stop } | Out-Null
+        Remove-PnPFolderWithRetry -Name $sourceFolderName -FolderServerRelativeUrl $sourceParentUrl
         $logRows.Add([pscustomobject]@{ OriginalName = $sourceFolderName; MovedAsName = $sourceFolderName; SourceUrl = $sourceFolderUrl; TargetUrl = ''; ItemType = 'Folder (root)'; Renamed = $false; Status = 'Success'; Error = '' })
       }
       catch {
