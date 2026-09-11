@@ -34,8 +34,13 @@
   of only Resolve-PnPFolder; folder existence checks now only treat genuine not-found errors as
   missing, so unrelated failures (throttling, permissions) surface instead of being masked.
 
-.Version 15 - Fixed issues with logging by adding SourceUrl and TargetUrl fields to better track moved items and 
-  resolved bug with null values $ExistingNames for the SourceUrl and TargetUrl fields.
+.Version 15 
+ -Fixed issues with logging by adding SourceUrl and TargetUrl fields to better track moved items  
+- resolved bug with null values $ExistingNames for the SourceUrl and TargetUrl fields.
+
+.Version 16
+- Fixed issue with folder moves where the target URL was incorrectly specified, causing failures when moving folders.
+
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -48,10 +53,10 @@ param(
   [string]$DocumentLibrary = 'Shared Documents',
 
   [Parameter()]
-  [string]$SourceFolderPath = 'general/clients',
+  [string]$SourceFolderPath = 'general/clients/w',
 
   [Parameter()]
-  [string]$DestinationFolderPath = 'clients',
+  [string]$DestinationFolderPath = 'clients/w',
 
   [Parameter()]
   [string]$TenantId = '9cfc42cb-51da-4055-87e9-b20a170b6ba3',
@@ -74,7 +79,7 @@ param(
   [string]$ClientSecret = $env:PNP_CLIENT_SECRET,
 
   [Parameter()]
-  [bool]$MoveDuplicateFileandFolders = $false,
+  [bool]$MoveDuplicateFileandFolders = $true,
 
   [Parameter()]
   [bool]$IncludeSourceFolder = $true,
@@ -597,21 +602,22 @@ function Move-FolderContentsRecursive {
       }
     }
     else {
-      $targetUrl = "$DestinationFolderServerRelativeUrl/$name"
+      $targetFolderUrl = "$DestinationFolderServerRelativeUrl/$name"
       if (-not $PSCmdlet.ShouldProcess($DestinationFolderServerRelativeUrl, "Move folder '$name'")) { continue }
 
       try {
-        Invoke-PnPWithRetry { Move-PnPFile -SourceUrl $sourceUrl -TargetUrl $targetUrl -Force -ErrorAction Stop } | Out-Null
+        # When moving a folder, Move-PnPFile requires -TargetUrl to be the destination PARENT folder.
+        Invoke-PnPWithRetry { Move-PnPFile -SourceUrl $sourceUrl -TargetUrl $DestinationFolderServerRelativeUrl -Force -ErrorAction Stop } | Out-Null
         [void]$destinationNames.Add($name)
         [void]$destinationFolderNames.Add($name)
         $Stats.Moved++
         Write-Info "Moved folder '$name'."
-        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; SourceUrl = $sourceUrl; TargetUrl = $targetUrl; ItemType = 'Folder'; Renamed = $false; Status = 'Success'; Error = '' })
+        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; SourceUrl = $sourceUrl; TargetUrl = $targetFolderUrl; ItemType = 'Folder'; Renamed = $false; Status = 'Success'; Error = '' })
       }
       catch {
         $Stats.Errors++
         Write-Warn "Failed to move folder '$name': $($_.Exception.Message)"
-        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; SourceUrl = $sourceUrl; TargetUrl = $targetUrl; ItemType = 'Folder'; Renamed = $false; Status = 'Failed'; Error = $_.Exception.Message })
+        $LogRows.Add([pscustomobject]@{ OriginalName = $name; MovedAsName = $name; SourceUrl = $sourceUrl; TargetUrl = $targetFolderUrl; ItemType = 'Folder'; Renamed = $false; Status = 'Failed'; Error = $_.Exception.Message })
       }
     }
 
