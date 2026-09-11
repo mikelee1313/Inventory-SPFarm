@@ -79,7 +79,7 @@ param(
   [string]$ClientSecret = $env:PNP_CLIENT_SECRET,
 
   [Parameter()]
-  [bool]$MoveDuplicateFileandFolders = $true,
+  [bool]$MoveDuplicateFileandFolders = $false,
 
   [Parameter()]
   [bool]$IncludeSourceFolder = $true,
