@@ -21,6 +21,11 @@ Application (client) ID of the Entra ID app registration.
 .PARAMETER Tenant
 Tenant name (contoso.onmicrosoft.com) or tenant ID.
 
+.PARAMETER AuthMode
+'AppOnly' (default) authenticates with the certificate/thumbprint. 'Delegate'
+signs in interactively as the current user and ignores the certificate
+parameters.
+
 .PARAMETER Thumbprint
 Thumbprint of a certificate installed in the current user's certificate store.
 
@@ -53,19 +58,23 @@ enumeration is not required because this script accepts one source SiteUrl.
 param(
     [Parameter()]
     [ValidatePattern('^https://')]
-    [uri]$SiteUrl = 'https://CONTOSO.sharepoint.com/sites/PCAHome',
+    [uri]$SiteUrl = 'https://<YOUR_TENANT_NAME>.sharepoint.com/sites/<YOUR_SITE_NAME>',
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$ClientId = 'abc12345-283f-47ba-a185-50d935d51d57',
+    [string]$ClientId = '<YOUR_CLIENT_ID>',
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string]$Tenant = '9cfc42cb-51da-9654-87e9-b20a170b6ba3',
+    [string]$Tenant = '<YOUR_TENANT_NAME_OR_ID>',
+
+    [Parameter()]
+    [ValidateSet('AppOnly', 'Delegate')]
+    [string]$AuthMode = 'Delegate',
 
     [Parameter(ParameterSetName = 'CertificateStore')]
     [ValidateNotNullOrEmpty()]
-    [string]$Thumbprint = 'C696FDCFE1453F3FBC6031F54DE988DA0FD905A9',
+    [string]$Thumbprint = 'B696FDCFE1453F3FBC6031F54DE988DA0ED905A9',
 
     [Parameter(ParameterSetName = 'CertificateFile')]
     [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
@@ -254,14 +263,20 @@ function New-SiteConnection {
         ErrorAction = 'Stop'
     }
 
-    if ($script:AuthenticationParameterSet -eq 'CertificateFile') {
-        $parameters.CertificatePath = $CertificatePath
-        if ($null -ne $CertificatePassword) {
-            $parameters.CertificatePassword = $CertificatePassword
+    if ($AuthMode -eq 'AppOnly') {
+        if ($script:AuthenticationParameterSet -eq 'CertificateFile') {
+            $parameters.CertificatePath = $CertificatePath
+            if ($null -ne $CertificatePassword) {
+                $parameters.CertificatePassword = $CertificatePassword
+            }
+        }
+        else {
+            $parameters.Thumbprint = $Thumbprint
         }
     }
     else {
-        $parameters.Thumbprint = $Thumbprint
+        # Delegate mode signs in as the current user instead of the app-only certificate.
+        $parameters.Interactive = $true
     }
 
     return Connect-PnPOnline @parameters
