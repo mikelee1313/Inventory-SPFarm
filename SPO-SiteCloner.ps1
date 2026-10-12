@@ -1,0 +1,1329 @@
+#Requires -Version 7.2
+#Requires -Modules PnP.PowerShell
+
+<#
+.SYNOPSIS
+    Clones the structure and content of a SharePoint Online site
+    into a new modern site collection.
+
+.DESCRIPTION
+    1. Creates the destination modern site collection if requested.
+    2. Extracts a PnP provisioning template from the source site.
+    3. Normalizes null modern-page web-part maps and applies the template.
+    4. Copies folders and files from document libraries.
+    5. Copies standard items from non-document lists.
+    6. Writes an incremental CSV log, console transcript, and PnP debug trace.
+
+.PARAMETER Tenant
+    Entra ID tenant ID or tenant domain, such as contoso.onmicrosoft.com.
+
+.PARAMETER Thumbprint
+    Thumbprint of a certificate in the Windows certificate store, accessible
+    to the account running the script. The certificate must have a private key.
+    Upload its matching public certificate to the Entra ID app registration.
+
+.PARAMETER MaxItemsPerList
+    Required positive maximum number of source items selected per in-scope list
+    or library per run, ordered by ascending source ID. Folders do not count.
+    Failed items and existing files skipped without OverwriteFiles still consume
+    a selection slot; later items are not substituted. Library folders are
+    copied without a limit. Existing destination content is not removed.
+    Does not limit template-managed pages or branding assets.
+    CopyListItems must still be enabled to copy non-document list items.
+
+.EXAMPLE
+
+    .\SPO-SiteCloner.ps1 -ClientId 'abc64618-283f-47ba-a185-50d935d51d57' -Tenant '9cfc42cb-51da-4055-87e9-b20a170b6ba3' 
+    -TenantAdminUrl 'https://m365cpi13246019-admin.sharepoint.com' -Thumbprint  'B696FDCFE1453F3FBC6031F54DE988DA0ED905A9' 
+    -SourceSiteUrl 'https://m365cpi13246019.sharepoint.com/sites/SalesandMarketing' 
+    -TargetSiteUrl 'https://m365cpi13246019.sharepoint.com/sites/sales3' 
+    -TargetSiteTitle "Sales and Marketing3" 
+    -TargetSiteOwner 'admin@M365CPI13246019.onmicrosoft.com' -MaxItemsPerList 10 
+
+.NOTES
+    Site-header provisioning is skipped by the internal SkipSiteHeader setting,
+    which defaults to true. Change it in the script to false to clone the site
+    header layout. No command-line switch is required or accepted for this setting.
+    Modern-page headers, navigation, and other branding handlers are unaffected.
+    Other provisioning errors still stop the run.
+
+    Each run writes CloneLog.csv, CloneTranscript.txt, and PnPTrace.log to its
+    timestamped working folder. Logs include site URLs, object names, and error
+    details; protect them as customer data. The CSV is written after each event.
+    Null serverProcessedContent maps are replaced with empty JSON objects in
+    NormalizedTemplate\SourceSiteTemplate.pnp. The original export remains unchanged.
+    Logs describe attempted operations, not a full SharePoint before/after audit.
+    A failed provisioning run can leave a partially modified destination.
+
+    All PnP connections use certificate-based application authentication.
+    No interactive or delegated sign-in is used.
+
+    Grant the app SharePoint APPLICATION permissions with tenant admin consent.
+    Sites.FullControl.All supports provisioning, permissions, and tenant site
+    creation in this script. Do not substitute Microsoft Graph permissions or
+    delegated permissions for these SharePoint application permissions.
+    For cloning existing sites with Sites.Selected instead, explicitly grant
+    the app full control on both sites and omit CreateTargetSite; tenant admin
+    operations require broader permissions. Some provisioning handlers or
+    SharePoint features may still require additional permissions.
+    TargetSiteOwner sets the new site's owner; it is not the sign-in identity.
+    Protect the certificate's private key and grant access only to the account
+    running the script. No PFX path or password is required by this script.
+
+    This is not a full-fidelity migration tool.
+
+    Not preserved:
+      - Version history
+      - Sharing links
+      - Audit history
+      - Retention record state
+      - Power Automate flows
+      - Teams or Planner content
+      - Original item IDs
+      - Original Created By / Modified By in every scenario
+      - Every complex field type
+      - All unique permissions
+#>
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)]
+    [string]$SourceSiteUrl,
+
+    [Parameter(Mandatory)]
+    [string]$TargetSiteUrl,
+
+    [Parameter(Mandatory)]
+    [string]$TargetSiteTitle,
+
+    [Parameter(Mandatory)]
+    [string]$TargetSiteOwner,
+
+    [Parameter(Mandatory)]
+    [string]$TenantAdminUrl,
+
+    [Parameter(Mandatory)]
+    [string]$ClientId,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Tenant,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Thumbprint,
+
+    [ValidateSet(
+        "CommunicationSite",
+        "TeamSiteWithoutMicrosoft365Group"
+    )]
+    [string]$TargetSiteType = "TeamSiteWithoutMicrosoft365Group",
+
+    [string]$WorkingFolder = "C:\Temp\PnPSiteClone",
+
+    [switch]$CreateTargetSite,
+
+    [switch]$CopyDocumentLibraries = $true,
+
+    [switch]$CopyListItems = $true,
+
+    [Parameter(Mandatory)]
+    [ValidateRange(1, [int]::MaxValue)]
+    [int]$MaxItemsPerList = 10,
+
+    [switch]$OverwriteFiles,
+
+    [switch]$IncludeHiddenLists
+)
+
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
+#------------------------------------------------------------
+# Initialization
+#------------------------------------------------------------
+
+$Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$RunFolder = Join-Path $WorkingFolder $Timestamp
+$TemplatePath = Join-Path $RunFolder "SourceSiteTemplate.pnp"
+$DownloadFolder = Join-Path $RunFolder "DownloadedContent"
+$LogPath = Join-Path $RunFolder "CloneLog.csv"
+$TranscriptPath = Join-Path $RunFolder "CloneTranscript.txt"
+$TracePath = Join-Path $RunFolder "PnPTrace.log"
+$ProvisioningTemplatePath = $TemplatePath
+$TranscriptStarted = $false
+$TraceStarted = $false
+$RunTimer = [System.Diagnostics.Stopwatch]::StartNew()
+$SkipSiteHeader = $true
+
+New-Item -Path $RunFolder -ItemType Directory -Force | Out-Null
+New-Item -Path $DownloadFolder -ItemType Directory -Force | Out-Null
+
+$script:LogEntries = [System.Collections.Generic.List[object]]::new()
+$script:SubfolderPagesToRelocate = [System.Collections.Generic.List[object]]::new()
+
+function Write-CloneLog {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet("Information", "Warning", "Error")]
+        [string]$Level,
+
+        [Parameter(Mandatory)]
+        [string]$Operation,
+
+        [string]$Object = "",
+
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $Details = ""
+    if ($null -ne $ErrorRecord) {
+        $Details = @(
+            $ErrorRecord.Exception.ToString()
+            "Error ID: $($ErrorRecord.FullyQualifiedErrorId)"
+            "Category: $($ErrorRecord.CategoryInfo)"
+            $ErrorRecord.InvocationInfo.PositionMessage
+            "PowerShell stack: $($ErrorRecord.ScriptStackTrace)"
+        ) -join [Environment]::NewLine
+    }
+
+    $Entry = [pscustomobject]@{
+        Time      = (Get-Date).ToString("o")
+        Sequence  = $script:LogEntries.Count + 1
+        ElapsedSeconds = [math]::Round($RunTimer.Elapsed.TotalSeconds, 3)
+        Level     = $Level
+        Operation = $Operation
+        Object    = $Object
+        Message   = $Message
+        Details   = $Details
+    }
+
+    $Entry | Export-Csv -Path $LogPath -NoTypeInformation -Encoding UTF8 -Append
+    $script:LogEntries.Add($Entry)
+
+    $Color = switch ($Level) {
+        "Information" { "Green" }
+        "Warning"     { "Yellow" }
+        "Error"       { "Red" }
+    }
+
+    Write-Host "[$Level] [$Operation] $Object $Message" -ForegroundColor $Color
+}
+
+function Repair-PnPPageWebPartJson {
+        param(
+            [Parameter(Mandatory)]
+            [string]$Path
+        )
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $Updates = @{}
+        $RepairCount = 0
+        $script:SubfolderPagesToRelocate.Clear()
+        $MapNames = @(
+            "htmlStrings", "searchablePlainTexts", "imageSources",
+            "links", "componentDependencies", "customMetadata"
+        )
+
+        $Archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        try {
+            foreach ($Entry in $Archive.Entries) {
+                if (-not $Entry.FullName.EndsWith(".xml", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    continue
+                }
+
+                $Reader = [System.IO.StreamReader]::new($Entry.Open())
+                try {
+                    $Document = [System.Xml.XmlDocument]::new()
+                    $Document.PreserveWhitespace = $true
+                    $Document.LoadXml($Reader.ReadToEnd())
+                }
+                finally {
+                    $Reader.Dispose()
+                }
+
+                $Changed = $false
+
+                # Normalize modern pages defined in subfolders (e.g. folder1/Folder2/Page.aspx).
+                # PnP Framework has a Windows-specific bug in ObjectClientSidePages.DeterminePageName
+                # where System.IO.Path.GetDirectoryName() injects backslashes into the page name,
+                # causing PnP Core's LoadClientSidePage to fail to find the page and throw NullReferenceException.
+                # We flatten the page name in the template so PnP provisions it cleanly into SitePages root,
+                # then relocate it to its destination subfolder post-provisioning.
+                foreach ($PageNode in $Document.SelectNodes("//*[local-name()='ClientSidePage']")) {
+                    $RawPageName = $PageNode.GetAttribute("PageName")
+                    if ($RawPageName -match "[\\/]") {
+                        $FlatPageName = [System.IO.Path]::GetFileName($RawPageName)
+                        $Subfolder = ([System.IO.Path]::GetDirectoryName($RawPageName)).Replace("\", "/")
+                        $script:SubfolderPagesToRelocate.Add([pscustomobject]@{
+                            OriginalRelativePath = $RawPageName.Replace("\", "/")
+                            FlatPageName         = $FlatPageName
+                            Subfolder            = $Subfolder
+                        })
+                        $PageNode.SetAttribute("PageName", $FlatPageName)
+                        $Changed = $true
+                        Write-CloneLog -Level Information -Operation "Template repair" -Object $RawPageName `
+                            -Message "Flattened subfolder page name to '$FlatPageName'. Will relocate to '$Subfolder/' post-provisioning."
+                    }
+                }
+
+                foreach ($Control in $Document.SelectNodes("//*[@JsonControlData]")) {
+                    $Page = $Control.SelectSingleNode("ancestor::*[local-name()='ClientSidePage'][1]")
+                    $ObjectName = "$($Entry.FullName)/$($Control.GetAttribute('ControlId'))"
+                    if ($null -ne $Page) {
+                        $ObjectName = "$($Page.GetAttribute('PageName'))/$($Control.GetAttribute('ControlId'))"
+                    }
+
+                    try {
+                        $Json = ConvertFrom-Json -InputObject $Control.GetAttribute("JsonControlData") -AsHashtable
+                        if ($Json -isnot [System.Collections.IDictionary]) {
+                            throw "Web-part JSON must be an object."
+                        }
+                        if (-not $Json.ContainsKey("serverProcessedContent")) {
+                            continue
+                        }
+
+                        $RepairedMaps = [System.Collections.Generic.List[string]]::new()
+                        if ($null -eq $Json["serverProcessedContent"]) {
+                            $Json["serverProcessedContent"] = @{}
+                            $RepairedMaps.Add("serverProcessedContent")
+                        }
+                        else {
+                            $Content = $Json["serverProcessedContent"]
+                            if ($Content -isnot [System.Collections.IDictionary]) {
+                                throw "serverProcessedContent must be an object or null."
+                            }
+                            foreach ($Name in $MapNames) {
+                                if ($Content.ContainsKey($Name)) {
+                                    if ($null -eq $Content[$Name]) {
+                                        $Content[$Name] = @{}
+                                        $RepairedMaps.Add("serverProcessedContent.$Name")
+                                    }
+                                    elseif ($Content[$Name] -isnot [System.Collections.IDictionary]) {
+                                        throw "serverProcessedContent.$Name must be an object or null."
+                                    }
+                                }
+                            }
+                        }
+
+                        if ($RepairedMaps.Count -gt 0) {
+                            $Control.SetAttribute("JsonControlData", (
+                                ConvertTo-Json -InputObject $Json -Depth 100 -Compress -WarningAction Stop
+                            ))
+                            $Changed = $true
+                            $RepairCount += $RepairedMaps.Count
+                            Write-CloneLog -Level Warning -Operation "Template repair" -Object $ObjectName `
+                                -Message "Normalized null maps to empty objects: $($RepairedMaps -join ', ')."
+                        }
+                    }
+                    catch {
+                        Write-CloneLog -Level Error -Operation "Template validation" -Object $ObjectName `
+                            -Message $_.Exception.Message -ErrorRecord $_
+                        throw
+                    }
+                }
+
+                if ($Changed) {
+                    $Updates[$Entry.FullName] = $Document
+                }
+            }
+        }
+        finally {
+            $Archive.Dispose()
+        }
+
+        if ($Updates.Count -eq 0) {
+            Write-CloneLog -Level Information -Operation "Template validation" -Object $Path `
+                -Message "No template repairs required (no null maps or subfolder pages)."
+            return $Path
+        }
+
+        # PnP resolves the template XML using the package basename when TemplateFileName is empty.
+        $NormalizedFolder = Join-Path (Split-Path $Path -Parent) "NormalizedTemplate"
+        New-Item -Path $NormalizedFolder -ItemType Directory -Force | Out-Null
+        $NormalizedPath = Join-Path $NormalizedFolder ([System.IO.Path]::GetFileName($Path))
+        Copy-Item -LiteralPath $Path -Destination $NormalizedPath -ErrorAction Stop
+        $Archive = [System.IO.Compression.ZipFile]::Open(
+            $NormalizedPath, [System.IO.Compression.ZipArchiveMode]::Update
+        )
+        try {
+            foreach ($Name in $Updates.Keys) {
+                $Archive.GetEntry($Name).Delete()
+                $Entry = $Archive.CreateEntry($Name)
+                $Stream = $Entry.Open()
+                try {
+                    $Updates[$Name].Save($Stream)
+                }
+                finally {
+                    $Stream.Dispose()
+                }
+            }
+        }
+        finally {
+            $Archive.Dispose()
+        }
+
+        Write-CloneLog -Level Information -Operation "Template repair" -Object $NormalizedPath `
+            -Message "Repaired $RepairCount null map(s) and flattened $($script:SubfolderPagesToRelocate.Count) subfolder page(s). Original package preserved at '$Path'."
+        return $NormalizedPath
+}
+
+function Save-CloneLog {
+    $script:LogEntries |
+        Export-Csv -Path $LogPath -NoTypeInformation -Encoding UTF8
+}
+
+function Convert-ToSafeFileName {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    $InvalidCharacters = [System.IO.Path]::GetInvalidFileNameChars()
+
+    foreach ($Character in $InvalidCharacters) {
+        $Name = $Name.Replace($Character, "_")
+    }
+
+    return $Name
+}
+
+function Get-SiteRelativePath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ServerRelativeUrl,
+
+        [Parameter(Mandatory)]
+        [string]$WebServerRelativeUrl
+    )
+
+    $WebRoot = $WebServerRelativeUrl.TrimEnd("/")
+
+    if ([string]::IsNullOrWhiteSpace($WebRoot)) {
+        return $ServerRelativeUrl.TrimStart("/")
+    }
+
+    if ($ServerRelativeUrl.StartsWith(
+        $WebRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        return $ServerRelativeUrl.Substring($WebRoot.Length).TrimStart("/")
+    }
+
+    return $ServerRelativeUrl.TrimStart("/")
+}
+
+function Test-IsSystemLibrary {
+    param(
+        [Parameter(Mandatory)]
+        $List
+    )
+
+    $ExcludedTitles = @(
+        "Form Templates",
+        "Converted Forms",
+        "Master Page Gallery",
+        "Site Collection Documents",
+        "Site Collection Images",
+        "Style Library",
+        "Preservation Hold Library",
+        "User Information List",
+        "Site Assets",
+        "Site Pages",
+        "Web Part Gallery",
+        "List Template Gallery",
+        "Theme Gallery",
+        "Solution Gallery"
+    )
+
+    if ($ExcludedTitles -contains $List.Title) {
+        return $true
+    }
+
+    if (
+        $List.RootFolder.ServerRelativeUrl -match
+        "/(_catalogs|_private|Style Library|PreservationHoldLibrary)(/|$)"
+    ) {
+        return $true
+    }
+
+    return $false
+}
+
+#------------------------------------------------------------
+# Folder creation
+#------------------------------------------------------------
+
+function Ensure-TargetFolder {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SiteRelativeFolder,
+
+        [Parameter(Mandatory)]
+        $Connection
+    )
+
+    $NormalizedPath = $SiteRelativeFolder.Trim("/")
+
+    if ([string]::IsNullOrWhiteSpace($NormalizedPath)) {
+        return
+    }
+
+    Resolve-PnPFolder `
+        -SiteRelativePath $NormalizedPath `
+        -Connection $Connection | Out-Null
+}
+
+#------------------------------------------------------------
+# Field-value conversion for standard SharePoint lists
+#------------------------------------------------------------
+
+function Convert-ListItemValues {
+    param(
+        [Parameter(Mandatory)]
+        $Item,
+
+        [Parameter(Mandatory)]
+        [array]$Fields
+    )
+
+    $Values = @{}
+
+    $SystemFieldNames = @(
+        "ID",
+        "GUID",
+        "Author",
+        "Editor",
+        "Created",
+        "Modified",
+        "Attachments",
+        "ContentType",
+        "ContentTypeId",
+        "_UIVersionString",
+        "_ModerationStatus",
+        "FileRef",
+        "FileDirRef",
+        "FileLeafRef",
+        "FSObjType",
+        "UniqueId",
+        "owshiddenversion",
+        "AppAuthor",
+        "AppEditor",
+        "ComplianceAssetId",
+        "_ComplianceFlags",
+        "_ComplianceTag",
+        "_ComplianceTagWrittenTime",
+        "_ComplianceTagUserId",
+        "_IsRecord",
+        "MetaInfo",
+        "Order"
+    )
+
+    foreach ($Field in $Fields) {
+        $InternalName = $Field.InternalName
+
+        if ($SystemFieldNames -contains $InternalName) {
+            continue
+        }
+
+        if ($Field.Hidden -or $Field.ReadOnlyField -or $Field.Sealed) {
+            continue
+        }
+
+        if (-not $Item.FieldValues.ContainsKey($InternalName)) {
+            continue
+        }
+
+        $Value = $Item.FieldValues[$InternalName]
+
+        if ($null -eq $Value) {
+            continue
+        }
+
+        try {
+            switch ($Field.TypeAsString) {
+                { $_ -in @("Computed", "Lookup", "LookupMulti") } {
+                    Write-CloneLog `
+                        -Level Warning `
+                        -Operation "List field" `
+                        -Object $InternalName `
+                        -Message "Skipped computed or lookup field."
+                    continue
+                }
+
+                { $_ -in @("User", "UserMulti") } {
+                    if ($Value -is [System.Array]) {
+                        $Emails = @(
+                            $Value |
+                            ForEach-Object {
+                                if ($_.Email) {
+                                    $_.Email
+                                }
+                                elseif ($_.LookupValue) {
+                                    $_.LookupValue
+                                }
+                            }
+                        )
+
+                        if ($Emails.Count -gt 0) {
+                            $Values[$InternalName] = $Emails
+                        }
+                    }
+                    elseif ($Value.Email) {
+                        $Values[$InternalName] = $Value.Email
+                    }
+
+                    continue
+                }
+
+                "TaxonomyFieldType" {
+                    if ($Value.TermGuid) {
+                        $Values[$InternalName] =
+                            "$($Value.Label)|$($Value.TermGuid)"
+                    }
+
+                    continue
+                }
+
+                "TaxonomyFieldTypeMulti" {
+                    $TaxonomyValues = @(
+                        $Value |
+                        ForEach-Object {
+                            "$($_.Label)|$($_.TermGuid)"
+                        }
+                    )
+
+                    if ($TaxonomyValues.Count -gt 0) {
+                        $Values[$InternalName] =
+                            $TaxonomyValues -join ";"
+                    }
+
+                    continue
+                }
+
+                "URL" {
+                    if ($Value.Url) {
+                        $Values[$InternalName] =
+                            "$($Value.Url), $($Value.Description)"
+                    }
+
+                    continue
+                }
+
+                default {
+                    $Values[$InternalName] = $Value
+                }
+            }
+        }
+        catch {
+            Write-CloneLog `
+                -Level Warning `
+                -Operation "List field" `
+                -Object $InternalName `
+                -Message "Could not convert value: $($_.Exception.Message)" `
+                -ErrorRecord $_
+        }
+    }
+
+    return $Values
+}
+
+#------------------------------------------------------------
+# Copy regular SharePoint list items
+#------------------------------------------------------------
+
+function Get-LimitedSourceItems {
+    param(
+        [Parameter(Mandatory)]
+        $SourceList,
+
+        [Parameter(Mandatory)]
+        $SourceConnection
+    )
+
+    $PageSize = [math]::Min(500, $MaxItemsPerList)
+    $Query = @"
+<View Scope='RecursiveAll'>
+  <Query>
+    <Where><Eq><FieldRef Name='FSObjType'/><Value Type='Integer'>0</Value></Eq></Where>
+    <OrderBy><FieldRef Name='ID' Ascending='TRUE'/></OrderBy>
+  </Query>
+  <RowLimit Paged='TRUE'>$PageSize</RowLimit>
+</View>
+"@
+
+    # RowLimit controls page size, not the total returned by PnP's paging loop.
+    Get-PnPListItem -List $SourceList.Title -Query $Query -PageSize $PageSize `
+        -Connection $SourceConnection |
+        Select-Object -First $MaxItemsPerList
+}
+
+function Copy-StandardListItems {
+    param(
+        [Parameter(Mandatory)]
+        $SourceList,
+
+        [Parameter(Mandatory)]
+        $SourceConnection,
+
+        [Parameter(Mandatory)]
+        $TargetConnection
+    )
+
+    Write-CloneLog `
+        -Level Information `
+        -Operation "List items" `
+        -Object $SourceList.Title `
+        -Message "Starting list-item copy."
+
+    try {
+        $TargetList = Get-PnPList `
+            -Identity $SourceList.Title `
+            -Includes BaseTemplate,RootFolder `
+            -Connection $TargetConnection `
+            -ErrorAction Stop
+
+        $Fields = Get-PnPField `
+            -List $SourceList.Title `
+            -Connection $SourceConnection
+
+        $Items = @(Get-LimitedSourceItems -SourceList $SourceList -SourceConnection $SourceConnection)
+        Write-CloneLog -Level Information -Operation "List items" -Object $SourceList.Title `
+            -Message "Selected $($Items.Count) items in ascending source ID order; limit=$MaxItemsPerList (folders excluded)."
+
+        $ItemCount = 0
+
+        foreach ($Item in $Items) {
+            try {
+                $Values = Convert-ListItemValues `
+                    -Item $Item `
+                    -Fields $Fields
+
+                $Folder = $null
+
+                if (
+                    $Item.FieldValues.ContainsKey("FileDirRef") -and
+                    $Item.FieldValues["FileDirRef"]
+                ) {
+                    $SourceFolder = [string]$Item.FieldValues["FileDirRef"]
+                    $ListRoot = $SourceList.RootFolder.ServerRelativeUrl
+
+                    if (
+                        $SourceFolder.StartsWith(
+                            $ListRoot,
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        )
+                    ) {
+                        $Folder = $SourceFolder.Substring(
+                            $ListRoot.Length
+                        ).Trim("/")
+                    }
+                }
+
+                $AddParameters = @{
+                    List       = $TargetList.Title
+                    Values     = $Values
+                    Connection = $TargetConnection
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($Folder)) {
+                    $AddParameters["Folder"] = $Folder
+                }
+
+                Add-PnPListItem @AddParameters | Out-Null
+                $ItemCount++
+
+                Write-CloneLog `
+                    -Level Information `
+                    -Operation "List item" `
+                    -Object "$($SourceList.Title)/$($Item.Id)" `
+                    -Message "Copied."
+            }
+            catch {
+                Write-CloneLog `
+                    -Level Error `
+                    -Operation "List item" `
+                    -Object "$($SourceList.Title)/$($Item.Id)" `
+                    -Message $_.Exception.Message `
+                    -ErrorRecord $_
+            }
+        }
+
+        Write-CloneLog `
+            -Level Information `
+            -Operation "List items" `
+            -Object $SourceList.Title `
+            -Message "Completed. Copied $ItemCount of $($Items.Count) selected items; limit=$MaxItemsPerList."
+    }
+    catch {
+        Write-CloneLog `
+            -Level Error `
+            -Operation "List items" `
+            -Object $SourceList.Title `
+            -Message $_.Exception.Message `
+            -ErrorRecord $_
+    }
+}
+
+#------------------------------------------------------------
+# Copy document-library files
+#------------------------------------------------------------
+
+function Copy-DocumentLibraryContent {
+    param(
+        [Parameter(Mandatory)]
+        $SourceList,
+
+        [Parameter(Mandatory)]
+        [string]$SourceWebServerRelativeUrl,
+
+        [Parameter(Mandatory)]
+        [string]$TargetWebServerRelativeUrl,
+
+        [Parameter(Mandatory)]
+        $SourceConnection,
+
+        [Parameter(Mandatory)]
+        $TargetConnection
+    )
+
+    Write-CloneLog `
+        -Level Information `
+        -Operation "Library" `
+        -Object $SourceList.Title `
+        -Message "Starting content copy."
+
+    try {
+        $TargetList = Get-PnPList `
+            -Identity $SourceList.Title `
+            -Includes RootFolder `
+            -Connection $TargetConnection `
+            -ErrorAction Stop
+
+        $SourceLibraryRoot = $SourceList.RootFolder.ServerRelativeUrl
+        $TargetLibraryRoot = $TargetList.RootFolder.ServerRelativeUrl
+
+        $FolderQuery = @"
+<View Scope='RecursiveAll'>
+  <Query>
+    <Where><Eq><FieldRef Name='FSObjType'/><Value Type='Integer'>1</Value></Eq></Where>
+  </Query>
+  <ViewFields><FieldRef Name='FileRef'/></ViewFields>
+</View>
+"@
+        $FolderItems = Get-PnPListItem `
+            -List $SourceList.Title `
+            -PageSize 500 `
+            -Query $FolderQuery `
+            -Connection $SourceConnection
+
+        # Create folders first
+        $Folders = $FolderItems |
+            Sort-Object {
+                ([string]$_.FieldValues["FileRef"]).Split("/").Count
+            }
+
+        foreach ($FolderItem in $Folders) {
+            try {
+                $SourceFolderUrl =
+                    [string]$FolderItem.FieldValues["FileRef"]
+
+                $RelativeFolder = $SourceFolderUrl.Substring(
+                    $SourceLibraryRoot.Length
+                ).Trim("/")
+
+                if ([string]::IsNullOrWhiteSpace($RelativeFolder)) {
+                    continue
+                }
+
+                $TargetFolderPath = (
+                    Get-SiteRelativePath `
+                        -ServerRelativeUrl $TargetLibraryRoot `
+                        -WebServerRelativeUrl $TargetWebServerRelativeUrl
+                ).TrimEnd("/")
+
+                $TargetFolderPath =
+                    "$TargetFolderPath/$RelativeFolder"
+
+                Ensure-TargetFolder `
+                    -SiteRelativeFolder $TargetFolderPath `
+                    -Connection $TargetConnection
+
+                Write-CloneLog `
+                    -Level Information `
+                    -Operation "Folder" `
+                    -Object $TargetFolderPath `
+                    -Message "Created or verified."
+            }
+            catch {
+                Write-CloneLog `
+                    -Level Error `
+                    -Operation "Folder" `
+                    -Object $FolderItem.FieldValues["FileRef"] `
+                    -Message $_.Exception.Message `
+                    -ErrorRecord $_
+            }
+        }
+
+        # Copy files
+        $Files = @(Get-LimitedSourceItems -SourceList $SourceList -SourceConnection $SourceConnection)
+        Write-CloneLog -Level Information -Operation "Library" -Object $SourceList.Title `
+            -Message "Selected $($Files.Count) files in ascending source ID order; limit=$MaxItemsPerList (folders excluded)."
+
+        $FileCount = 0
+
+        foreach ($FileItem in $Files) {
+            $MemoryStream = $null
+
+            try {
+                $SourceFileUrl =
+                    [string]$FileItem.FieldValues["FileRef"]
+
+                $FileName =
+                    [string]$FileItem.FieldValues["FileLeafRef"]
+
+                $SourceParentFolder =
+                    [string]$FileItem.FieldValues["FileDirRef"]
+
+                $RelativeFolder = $SourceParentFolder.Substring(
+                    $SourceLibraryRoot.Length
+                ).Trim("/")
+
+                $TargetLibrarySiteRelative = Get-SiteRelativePath `
+                    -ServerRelativeUrl $TargetLibraryRoot `
+                    -WebServerRelativeUrl $TargetWebServerRelativeUrl
+
+                $TargetFolder = $TargetLibrarySiteRelative.TrimEnd("/")
+
+                if (-not [string]::IsNullOrWhiteSpace($RelativeFolder)) {
+                    $TargetFolder = "$TargetFolder/$RelativeFolder"
+                }
+
+                Ensure-TargetFolder `
+                    -SiteRelativeFolder $TargetFolder `
+                    -Connection $TargetConnection
+
+                $TargetServerRelativeFileUrl = (
+                    "$TargetWebServerRelativeUrl/$TargetFolder/$FileName"
+                ) -replace "//+", "/"
+
+                if (-not $OverwriteFiles) {
+                    $ExistingFile = Get-PnPFile `
+                        -Url $TargetServerRelativeFileUrl `
+                        -AsFileObject `
+                        -Connection $TargetConnection `
+                        -ErrorAction SilentlyContinue
+
+                    if ($null -ne $ExistingFile) {
+                        Write-CloneLog `
+                            -Level Warning `
+                            -Operation "File" `
+                            -Object $SourceFileUrl `
+                            -Message "Skipped because the destination file exists."
+                        continue
+                    }
+                }
+
+                $MemoryStream = Get-PnPFile `
+                    -Url $SourceFileUrl `
+                    -AsMemoryStream `
+                    -Connection $SourceConnection
+
+                Add-PnPFile `
+                    -Folder $TargetFolder `
+                    -FileName $FileName `
+                    -Stream $MemoryStream `
+                    -Connection $TargetConnection | Out-Null
+
+                $FileCount++
+
+                Write-CloneLog `
+                    -Level Information `
+                    -Operation "File" `
+                    -Object $SourceFileUrl `
+                    -Message "Copied to $TargetFolder/$FileName"
+            }
+            catch {
+                Write-CloneLog `
+                    -Level Error `
+                    -Operation "File" `
+                    -Object $FileItem.FieldValues["FileRef"] `
+                    -Message $_.Exception.Message `
+                    -ErrorRecord $_
+            }
+            finally {
+                if ($null -ne $MemoryStream) {
+                    $MemoryStream.Dispose()
+                }
+            }
+        }
+
+        Write-CloneLog `
+            -Level Information `
+            -Operation "Library" `
+            -Object $SourceList.Title `
+            -Message "Completed. Copied $FileCount of $($Files.Count) selected files; limit=$MaxItemsPerList."
+    }
+    catch {
+        Write-CloneLog `
+            -Level Error `
+            -Operation "Library" `
+            -Object $SourceList.Title `
+            -Message $_.Exception.Message `
+            -ErrorRecord $_
+    }
+}
+
+#------------------------------------------------------------
+# Main execution
+#------------------------------------------------------------
+
+try {
+    Start-Transcript -Path $TranscriptPath -ErrorAction Stop | Out-Null
+    $TranscriptStarted = $true
+    Set-PnPTraceLog -On -LogFile $TracePath -Level Debug -AutoFlush $true
+    $TraceStarted = $true
+
+    Write-CloneLog `
+        -Level Information `
+        -Operation "Initialize" `
+        -Message "Starting SharePoint site clone."
+
+    $PnPModule = Get-Module PnP.PowerShell
+    Write-CloneLog -Level Information -Operation "Configuration" `
+        -Message ("PowerShell=$($PSVersionTable.PSVersion); PnP.PowerShell=$($PnPModule.Version); " +
+            "Source=$SourceSiteUrl; Target=$TargetSiteUrl; CreateTargetSite=$CreateTargetSite; " +
+            "CopyDocumentLibraries=$CopyDocumentLibraries; CopyListItems=$CopyListItems; " +
+            "MaxItemsPerList=$MaxItemsPerList; " +
+            "SkipSiteHeader=$SkipSiteHeader; " +
+            "OverwriteFiles=$OverwriteFiles; IncludeHiddenLists=$IncludeHiddenLists")
+
+    $AuthenticationParameters = @{
+        ClientId         = $ClientId
+        Tenant           = $Tenant
+        Thumbprint       = $Thumbprint
+        ReturnConnection = $true
+    }
+
+    # Connect to source
+    $SourceConnection = Connect-PnPOnline `
+        -Url $SourceSiteUrl `
+        @AuthenticationParameters
+
+    $SourceWeb = Get-PnPWeb `
+        -Includes Title,Url,ServerRelativeUrl,WebTemplate `
+        -Connection $SourceConnection
+
+    Write-CloneLog `
+        -Level Information `
+        -Operation "Connect" `
+        -Object $SourceSiteUrl `
+        -Message "Connected to source site '$($SourceWeb.Title)'."
+
+    # Create destination site if requested
+    if ($CreateTargetSite) {
+        $AdminConnection = Connect-PnPOnline `
+            -Url $TenantAdminUrl `
+            @AuthenticationParameters
+
+        try {
+            $ExistingTarget = Get-PnPTenantSite `
+                -Url $TargetSiteUrl `
+                -Connection $AdminConnection `
+                -ErrorAction SilentlyContinue
+        }
+        catch {
+            $ExistingTarget = $null
+        }
+
+        if ($null -eq $ExistingTarget) {
+            Write-CloneLog `
+                -Level Information `
+                -Operation "Create site" `
+                -Object $TargetSiteUrl `
+                -Message "Creating destination site collection."
+
+            if ($TargetSiteType -eq "CommunicationSite") {
+                New-PnPSite `
+                    -Type CommunicationSite `
+                    -Title $TargetSiteTitle `
+                    -Url $TargetSiteUrl `
+                    -Owner $TargetSiteOwner `
+                    -Wait `
+                    -Connection $AdminConnection | Out-Null
+            }
+            else {
+                New-PnPSite `
+                    -Type TeamSiteWithoutMicrosoft365Group `
+                    -Title $TargetSiteTitle `
+                    -Url $TargetSiteUrl `
+                    -Owner $TargetSiteOwner `
+                    -Wait `
+                    -Connection $AdminConnection | Out-Null
+            }
+
+            Write-CloneLog `
+                -Level Information `
+                -Operation "Create site" `
+                -Object $TargetSiteUrl `
+                -Message "Destination site collection created."
+        }
+        else {
+            Write-CloneLog `
+                -Level Warning `
+                -Operation "Create site" `
+                -Object $TargetSiteUrl `
+                -Message "Destination already exists; creation skipped."
+        }
+    }
+
+    # Connect to destination
+    $TargetConnection = Connect-PnPOnline `
+        -Url $TargetSiteUrl `
+        @AuthenticationParameters
+
+    $TargetWeb = Get-PnPWeb `
+        -Includes Title,Url,ServerRelativeUrl `
+        -Connection $TargetConnection
+
+    Write-CloneLog `
+        -Level Information `
+        -Operation "Connect" `
+        -Object $TargetSiteUrl `
+        -Message "Connected to destination site '$($TargetWeb.Title)'."
+
+    # Export provisioning package
+    Write-CloneLog `
+        -Level Information `
+        -Operation "Template" `
+        -Object $TemplatePath `
+        -Message "Extracting source structure."
+
+    $TemplateParameters = @{
+        Out                    = $TemplatePath
+        IncludeAllPages        = $true
+        IncludeSiteGroups      = $true
+        PersistBrandingFiles   = $true
+        PersistPublishingFiles = $true
+        Force                  = $true
+        Connection             = $SourceConnection
+    }
+
+    if ($IncludeHiddenLists) {
+        $TemplateParameters["IncludeHiddenLists"] = $true
+    }
+
+    Get-PnPSiteTemplate @TemplateParameters
+
+    Write-CloneLog `
+        -Level Information `
+        -Operation "Template" `
+        -Object $TemplatePath `
+        -Message "Source structure extracted."
+
+    $ProvisioningTemplatePath = Repair-PnPPageWebPartJson -Path $TemplatePath
+
+    # Apply provisioning package
+    Write-CloneLog `
+        -Level Information `
+        -Operation "Template" `
+        -Object $TargetSiteUrl `
+        -Message "Applying source structure to destination."
+
+    $ApplyParameters = @{
+        Path                         = $ProvisioningTemplatePath
+        Connection                   = $TargetConnection
+        ClearNavigation              = $true
+        IgnoreDuplicateDataRowErrors  = $true
+    }
+    if ($SkipSiteHeader) {
+        $ApplyParameters["ExcludeHandlers"] = [PnP.Framework.Provisioning.Model.Handlers]::SiteHeader
+        Write-CloneLog -Level Warning -Operation "Template" -Object $TargetSiteUrl `
+            -Message "SiteHeader provisioning explicitly skipped; destination site-header layout retained."
+    }
+
+    try {
+        Invoke-PnPSiteTemplate @ApplyParameters
+    }
+    catch {
+        $PnpEx = Get-PnPException
+        $ExMsg = if ($PnpEx -and $PnpEx.Message) { $PnpEx.Message } else { $_.Exception.Message }
+        $ExStack = if ($PnpEx -and $PnpEx.Stacktrace) { $PnpEx.Stacktrace } else { $_.ScriptStackTrace }
+        Write-CloneLog -Level Error -Operation "Template" -Object $TargetSiteUrl `
+            -Message "Invoke-PnPSiteTemplate failed: $ExMsg`nStacktrace:`n$ExStack" -ErrorRecord $_
+        throw
+    }
+
+    Write-CloneLog `
+        -Level Information `
+        -Operation "Template" `
+        -Object $TargetSiteUrl `
+        -Message "Destination structure provisioned."
+
+    # Relocate any modern pages defined in subfolders that were flattened during template preparation
+    if ($null -ne $script:SubfolderPagesToRelocate -and $script:SubfolderPagesToRelocate.Count -gt 0) {
+        Write-CloneLog `
+            -Level Information `
+            -Operation "Page relocation" `
+            -Object $TargetSiteUrl `
+            -Message "Relocating $($script:SubfolderPagesToRelocate.Count) modern page(s) to destination subfolder(s)."
+
+        $TargetServerRelUrl = $TargetWeb.ServerRelativeUrl.TrimEnd("/")
+
+        foreach ($PageReloc in $script:SubfolderPagesToRelocate) {
+            try {
+                $SubfolderSiteRel = "SitePages/$($PageReloc.Subfolder)"
+                Resolve-PnPFolder -SiteRelativePath $SubfolderSiteRel -Connection $TargetConnection | Out-Null
+
+                $SourceUrl = "$TargetServerRelUrl/SitePages/$($PageReloc.FlatPageName)"
+                $DestUrl = "$TargetServerRelUrl/SitePages/$($PageReloc.OriginalRelativePath)"
+
+                Move-PnPFile -SourceUrl $SourceUrl -TargetUrl $DestUrl -Overwrite -Force -Connection $TargetConnection
+
+                Write-CloneLog `
+                    -Level Information `
+                    -Operation "Page relocation" `
+                    -Object $PageReloc.OriginalRelativePath `
+                    -Message "Relocated '$($PageReloc.FlatPageName)' -> '$($PageReloc.OriginalRelativePath)' successfully."
+            }
+            catch {
+                Write-CloneLog `
+                    -Level Warning `
+                    -Operation "Page relocation" `
+                    -Object $PageReloc.OriginalRelativePath `
+                    -Message "Failed to relocate page '$($PageReloc.FlatPageName)': $($_.Exception.Message)" `
+                    -ErrorRecord $_
+            }
+        }
+    }
+
+    # Retrieve source lists/libraries
+    $SourceLists = Get-PnPList `
+        -Includes Title,Hidden,BaseTemplate,BaseType,RootFolder,ItemCount `
+        -Connection $SourceConnection
+
+    foreach ($SourceList in $SourceLists) {
+        if ($SourceList.Hidden -and -not $IncludeHiddenLists) {
+            continue
+        }
+
+        # Document libraries use BaseType 1
+        if ([int]$SourceList.BaseType -eq 1) {
+            if (-not $CopyDocumentLibraries) {
+                continue
+            }
+
+            if (Test-IsSystemLibrary -List $SourceList) {
+                Write-CloneLog `
+                    -Level Warning `
+                    -Operation "Library" `
+                    -Object $SourceList.Title `
+                    -Message "Skipped system or template-managed library."
+                continue
+            }
+
+            Copy-DocumentLibraryContent `
+                -SourceList $SourceList `
+                -SourceWebServerRelativeUrl $SourceWeb.ServerRelativeUrl `
+                -TargetWebServerRelativeUrl $TargetWeb.ServerRelativeUrl `
+                -SourceConnection $SourceConnection `
+                -TargetConnection $TargetConnection
+
+            continue
+        }
+
+        if (-not $CopyListItems) {
+            continue
+        }
+
+        # Skip standard system galleries and workflow/history lists
+        $ExcludedListTemplates = @(
+            110, # Data Sources
+            111, # Site Template Gallery
+            112, # User Information
+            113, # Web Part Gallery
+            114, # List Template Gallery
+            117, # No-code workflows
+            140, # Workflow History
+            150, # Gantt Tasks
+            544  # Microfeed
+        )
+
+        if ($ExcludedListTemplates -contains [int]$SourceList.BaseTemplate) {
+            Write-CloneLog `
+                -Level Warning `
+                -Operation "List" `
+                -Object $SourceList.Title `
+                -Message "Skipped system list template."
+            continue
+        }
+
+        Copy-StandardListItems `
+            -SourceList $SourceList `
+            -SourceConnection $SourceConnection `
+            -TargetConnection $TargetConnection
+    }
+
+    $CopyErrors = @($script:LogEntries | Where-Object Level -eq "Error").Count
+    if ($CopyErrors -gt 0) {
+        Write-CloneLog -Level Warning -Operation "Complete" -Object $TargetSiteUrl `
+            -Message "SharePoint site clone finished with $CopyErrors error events. Review the logs for items that were not copied."
+    }
+    else {
+        Write-CloneLog -Level Information -Operation "Complete" -Object $TargetSiteUrl `
+            -Message "SharePoint site clone completed."
+    }
+}
+catch {
+    $FatalError = $_
+    try {
+        $PnPException = Get-PnPException
+        if ($null -ne $PnPException) {
+            Write-CloneLog -Level Error -Operation "PnP exception" `
+                -Message ($PnPException | Format-List * -Force | Out-String -Width 240)
+        }
+    }
+    catch {
+        Write-CloneLog -Level Warning -Operation "Diagnostics" `
+            -Message "Could not retrieve PnP exception: $($_.Exception.Message)" -ErrorRecord $_
+    }
+
+    Write-CloneLog `
+        -Level Error `
+        -Operation "Fatal" `
+        -Message $FatalError.Exception.Message `
+        -ErrorRecord $FatalError
+
+    throw
+}
+finally {
+    try {
+        $Errors = @($script:LogEntries | Where-Object Level -eq "Error").Count
+        $Warnings = @($script:LogEntries | Where-Object Level -eq "Warning").Count
+        Write-CloneLog -Level Information -Operation "Run summary" `
+            -Message "Elapsed=$($RunTimer.Elapsed); Error events=$Errors; Warning events=$Warnings."
+        Save-CloneLog
+    }
+    finally {
+        try {
+            if ($TraceStarted) {
+                Set-PnPTraceLog -Off
+            }
+        }
+        finally {
+            Write-Host ""
+            Write-Host "Clone log: $LogPath" -ForegroundColor Cyan
+            Write-Host "PnP trace: $TracePath" -ForegroundColor Cyan
+            Write-Host "Transcript: $TranscriptPath" -ForegroundColor Cyan
+            Write-Host "Original template: $TemplatePath" -ForegroundColor Cyan
+            Write-Host "Applied template:  $ProvisioningTemplatePath" -ForegroundColor Cyan
+            if ($TranscriptStarted) {
+                Stop-Transcript | Out-Null
+            }
+            $RunTimer.Stop()
+        }
+    }
+}
