@@ -129,7 +129,7 @@ param(
 
     [Parameter(Mandatory)]
     [ValidateRange(1, [int]::MaxValue)]
-    [int]$MaxItemsPerList = 10,
+    [int]$MaxItemsPerList,
 
     [switch]$OverwriteFiles,
 
