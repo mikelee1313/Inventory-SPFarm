@@ -45,11 +45,12 @@
     which defaults to true. Change it in the script to false to clone the site
     header layout. No command-line switch is required or accepted for this setting.
     Modern-page headers, navigation, and other branding handlers are unaffected.
-    Before provisioning, an unused legacy Design File content type definition
-    (0x010100A2E0023C4C216242892749CE60EC3D07) is omitted from the normalized
-    package only if its name conflicts with a different destination ID.
-    Referenced definitions and other same-name/different-ID conflicts stop the
-    run for review. Destination content types are never deleted or remapped.
+    Before provisioning, unused legacy Design File and Display Template family
+    definitions are omitted from the normalized package when their names conflict
+    with different destination IDs. Known legacy descendants of an omitted parent
+    are handled together. References outside that omitted family, custom
+    descendants, and other same-name/different-ID conflicts stop the run for review.
+    Destination content types are never deleted or remapped.
     Provisioning failures stop the run. Required destination lists and libraries
     are validated before any content copying starts.
 
@@ -275,13 +276,24 @@ function Repair-PnPPageWebPartJson {
                 $Documents[$Entry.FullName] = $Document
             }
 
-            foreach ($EntryName in $Documents.Keys) {
-                $Document = $Documents[$EntryName]
-                $Changed = $false
-
-                foreach ($ContentType in @($Document.SelectNodes(
+            $LegacyTypes = @{
+                "0x010100A2E0023C4C216242892749CE60EC3D07" = "Design File"
+                "0x010100D6D2648C086C5345BB838DE320B6DEBE" = "Display Template"
+                "0x010100D6D2648C086C5345BB838DE320B6DEBE01" = "Control Display Template"
+                "0x010100D6D2648C086C5345BB838DE320B6DEBE02" = "Group Display Template"
+                "0x010100D6D2648C086C5345BB838DE320B6DEBE03" = "Item Display Template"
+                "0x010100D6D2648C086C5345BB838DE320B6DEBE04" = "Filter Display Template"
+                "0x010100D6D2648C086C5345BB838DE320B6DEBE05" = "Display Template Code"
+            }
+            $Definitions = @(
+                foreach ($Part in $Documents.Values) {
+                    $Part.SelectNodes(
                     "//*[local-name()='ContentTypes']/*[local-name()='ContentType']"
-                ))) {
+                    )
+                }
+            )
+            $Omissions = @{}
+            foreach ($ContentType in $Definitions) {
                     $Id = $ContentType.GetAttribute("ID")
                     $Name = $ContentType.GetAttribute("Name")
                     if (@($DestinationContentTypes | Where-Object { [string]$_.Id -eq $Id }).Count -gt 0) {
@@ -293,27 +305,65 @@ function Repair-PnPPageWebPartJson {
                     }
 
                     $ConflictIds = ($Conflicts | ForEach-Object { [string]$_.Id }) -join ", "
-                    if ($Name -ne "Design File" -or $Id -ne "0x010100A2E0023C4C216242892749CE60EC3D07") {
+                    if (-not $LegacyTypes.ContainsKey($Id) -or $LegacyTypes[$Id] -ne $Name) {
                         throw "Content type '$Name' has template ID '$Id' but destination ID(s) '$ConflictIds'. Resolve this conflict before provisioning."
                     }
 
-                    # Include descendant IDs and references in other XML parts, not just list bindings.
+                    foreach ($Descendant in $Definitions) {
+                        $DescendantId = $Descendant.GetAttribute("ID")
+                        if (-not $DescendantId.StartsWith($Id, [System.StringComparison]::OrdinalIgnoreCase)) {
+                            continue
+                        }
+                        if (-not $LegacyTypes.ContainsKey($DescendantId) -or
+                            $LegacyTypes[$DescendantId] -ne $Descendant.GetAttribute("Name")) {
+                            throw "Conflicting content type '$Name' ($Id) has custom descendant '$DescendantId'. Resolve its dependencies before provisioning."
+                        }
+                        $Omissions[$DescendantId] = $Descendant
+                    }
+            }
+
+            # Validate the whole omission set before editing; references within it are harmless.
+            foreach ($ContentType in $Omissions.Values) {
+                    $Id = $ContentType.GetAttribute("ID")
+                    $Name = $ContentType.GetAttribute("Name")
+                    $NameToken = '\{contenttypeid:\s*' + [regex]::Escape($Name) + '\s*\}'
                     foreach ($Part in $Documents.Values) {
                         foreach ($Reference in $Part.SelectNodes("//@* | //text()")) {
-                            if ([object]::ReferenceEquals($Reference, $ContentType.GetAttributeNode("ID"))) {
+                            $Owner = if ($Reference -is [System.Xml.XmlAttribute]) {
+                                $Reference.OwnerElement
+                            }
+                            else {
+                                $Reference.ParentNode
+                            }
+                            $Definition = $Owner.SelectSingleNode(
+                                "ancestor-or-self::*[local-name()='ContentType' and parent::*[local-name()='ContentTypes']]"
+                            )
+                            if ($null -ne $Definition -and $Omissions.ContainsKey($Definition.GetAttribute("ID"))) {
                                 continue
                             }
                             if ($Reference.Value.IndexOf($Id, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
-                                $Reference.Value -match '\{contenttypeid:\s*Design File\s*\}') {
-                                throw "Conflicting content type '$Name' ($Id; destination: $ConflictIds) is referenced in the package. Resolve its dependencies before provisioning."
+                                $Reference.Value -match $NameToken) {
+                                throw "Conflicting content type '$Name' ($Id) is referenced outside the omitted legacy family in the package. Resolve its dependencies before provisioning."
                             }
                         }
                     }
+            }
 
+            foreach ($EntryName in $Documents.Keys) {
+                $Document = $Documents[$EntryName]
+                $Changed = $false
+                foreach ($ContentType in @($Document.SelectNodes(
+                    "//*[local-name()='ContentTypes']/*[local-name()='ContentType']"
+                ))) {
+                    $Id = $ContentType.GetAttribute("ID")
+                    if (-not $Omissions.ContainsKey($Id)) {
+                        continue
+                    }
+                    $Name = $ContentType.GetAttribute("Name")
                     $null = $ContentType.ParentNode.RemoveChild($ContentType)
                     $Changed = $true
                     Write-CloneLog -Level Warning -Operation "Template repair" -Object $Name `
-                        -Message "Omitted unused legacy content type '$Id'; destination already has '$Name' with ID(s) '$ConflictIds'. No destination content type was changed."
+                        -Message "Omitted unused legacy content type '$Name' ($Id) because it or its legacy parent conflicts with a destination content type. No destination content type was changed."
                 }
 
                 # Normalize modern pages defined in subfolders (e.g. folder1/Folder2/Page.aspx).
