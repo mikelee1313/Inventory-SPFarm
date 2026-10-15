@@ -45,6 +45,9 @@
     which defaults to true. Change it in the script to false to clone the site
     header layout. No command-line switch is required or accepted for this setting.
     Modern-page headers, navigation, and other branding handlers are unaffected.
+    A duplicate content type error is logged as a warning and content copying
+    continues. Template provisioning may be incomplete: handlers after the
+    failure are not resumed, and dependent lists or content may fail to copy.
     Other provisioning errors still stop the run.
 
     Each run writes CloneLog.csv, CloneTranscript.txt, and PnPTrace.log to its
@@ -85,6 +88,7 @@
       - All unique permissions
 #>
 
+#region Script Parameters
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
@@ -135,7 +139,9 @@ param(
 
     [switch]$IncludeHiddenLists
 )
+#endregion Script Parameters
 
+#region Initialization and Run Configuration
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
@@ -161,7 +167,10 @@ New-Item -Path $DownloadFolder -ItemType Directory -Force | Out-Null
 
 $script:LogEntries = [System.Collections.Generic.List[object]]::new()
 $script:SubfolderPagesToRelocate = [System.Collections.Generic.List[object]]::new()
+#endregion Initialization and Run Configuration
 
+#region Helper Functions
+#region Incremental Logging
 function Write-CloneLog {
     param(
         [Parameter(Mandatory)]
@@ -212,7 +221,9 @@ function Write-CloneLog {
 
     Write-Host "[$Level] [$Operation] $Object $Message" -ForegroundColor $Color
 }
+#endregion Incremental Logging
 
+#region Template Validation and Repair
 function Repair-PnPPageWebPartJson {
         param(
             [Parameter(Mandatory)]
@@ -370,12 +381,16 @@ function Repair-PnPPageWebPartJson {
             -Message "Repaired $RepairCount null map(s) and flattened $($script:SubfolderPagesToRelocate.Count) subfolder page(s). Original package preserved at '$Path'."
         return $NormalizedPath
 }
+    #endregion Template Validation and Repair
 
+    #region Log Export
 function Save-CloneLog {
     $script:LogEntries |
         Export-Csv -Path $LogPath -NoTypeInformation -Encoding UTF8
 }
+    #endregion Log Export
 
+    #region File Names and Site-Relative Paths
 function Convert-ToSafeFileName {
     param(
         [Parameter(Mandatory)]
@@ -415,7 +430,9 @@ function Get-SiteRelativePath {
 
     return $ServerRelativeUrl.TrimStart("/")
 }
+#endregion File Names and Site-Relative Paths
 
+#region System Library Filtering
 function Test-IsSystemLibrary {
     param(
         [Parameter(Mandatory)]
@@ -452,7 +469,9 @@ function Test-IsSystemLibrary {
 
     return $false
 }
+#endregion System Library Filtering
 
+#region Destination Folder Creation
 #------------------------------------------------------------
 # Folder creation
 #------------------------------------------------------------
@@ -476,7 +495,9 @@ function Ensure-TargetFolder {
         -SiteRelativePath $NormalizedPath `
         -Connection $Connection | Out-Null
 }
+    #endregion Destination Folder Creation
 
+    #region List Field-Value Conversion
 #------------------------------------------------------------
 # Field-value conversion for standard SharePoint lists
 #------------------------------------------------------------
@@ -630,7 +651,9 @@ function Convert-ListItemValues {
 
     return $Values
 }
+#endregion List Field-Value Conversion
 
+#region Limited Source Item Selection
 #------------------------------------------------------------
 # Copy regular SharePoint list items
 #------------------------------------------------------------
@@ -660,7 +683,9 @@ function Get-LimitedSourceItems {
         -Connection $SourceConnection |
         Select-Object -First $MaxItemsPerList
 }
+    #endregion Limited Source Item Selection
 
+    #region Standard List Item Copying
 function Copy-StandardListItems {
     param(
         [Parameter(Mandatory)]
@@ -768,6 +793,9 @@ function Copy-StandardListItems {
     }
 }
 
+#endregion Standard List Item Copying
+
+#region Document Library Content Copying
 #------------------------------------------------------------
 # Copy document-library files
 #------------------------------------------------------------
@@ -806,6 +834,7 @@ function Copy-DocumentLibraryContent {
         $SourceLibraryRoot = $SourceList.RootFolder.ServerRelativeUrl
         $TargetLibraryRoot = $TargetList.RootFolder.ServerRelativeUrl
 
+        #region Library Folder Creation
         $FolderQuery = @"
 <View Scope='RecursiveAll'>
   <Query>
@@ -868,6 +897,9 @@ function Copy-DocumentLibraryContent {
             }
         }
 
+        #endregion Library Folder Creation
+
+        #region Library File Copying
         # Copy files
         $Files = @(Get-LimitedSourceItems -SourceList $SourceList -SourceConnection $SourceConnection)
         Write-CloneLog -Level Information -Operation "Library" -Object $SourceList.Title `
@@ -961,6 +993,8 @@ function Copy-DocumentLibraryContent {
             }
         }
 
+        #endregion Library File Copying
+
         Write-CloneLog `
             -Level Information `
             -Operation "Library" `
@@ -977,11 +1011,16 @@ function Copy-DocumentLibraryContent {
     }
 }
 
+#endregion Document Library Content Copying
+#endregion Helper Functions
+
+#region Main Execution
 #------------------------------------------------------------
 # Main execution
 #------------------------------------------------------------
 
 try {
+    #region Diagnostics and Authentication Setup
     Start-Transcript -Path $TranscriptPath -ErrorAction Stop | Out-Null
     $TranscriptStarted = $true
     Set-PnPTraceLog -On -LogFile $TracePath -Level Debug -AutoFlush $true
@@ -1008,6 +1047,9 @@ try {
         ReturnConnection = $true
     }
 
+    #endregion Diagnostics and Authentication Setup
+
+    #region Source Site Connection
     # Connect to source
     $SourceConnection = Connect-PnPOnline `
         -Url $SourceSiteUrl `
@@ -1023,6 +1065,9 @@ try {
         -Object $SourceSiteUrl `
         -Message "Connected to source site '$($SourceWeb.Title)'."
 
+    #endregion Source Site Connection
+
+    #region Optional Destination Site Creation
     # Create destination site if requested
     if ($CreateTargetSite) {
         $AdminConnection = Connect-PnPOnline `
@@ -1080,6 +1125,9 @@ try {
         }
     }
 
+    #endregion Optional Destination Site Creation
+
+    #region Destination Site Connection
     # Connect to destination
     $TargetConnection = Connect-PnPOnline `
         -Url $TargetSiteUrl `
@@ -1095,6 +1143,9 @@ try {
         -Object $TargetSiteUrl `
         -Message "Connected to destination site '$($TargetWeb.Title)'."
 
+    #endregion Destination Site Connection
+
+    #region Template Export and Repair
     # Export provisioning package
     Write-CloneLog `
         -Level Information `
@@ -1126,6 +1177,9 @@ try {
 
     $ProvisioningTemplatePath = Repair-PnPPageWebPartJson -Path $TemplatePath
 
+    #endregion Template Export and Repair
+
+    #region Template Application and Duplicate Content Type Handling
     # Apply provisioning package
     Write-CloneLog `
         -Level Information `
@@ -1145,24 +1199,38 @@ try {
             -Message "SiteHeader provisioning explicitly skipped; destination site-header layout retained."
     }
 
+    $TemplateProvisioned = $false
     try {
-        Invoke-PnPSiteTemplate @ApplyParameters
+        Invoke-PnPSiteTemplate @ApplyParameters -ErrorAction Stop
+        $TemplateProvisioned = $true
     }
     catch {
-        $PnpEx = Get-PnPException
-        $ExMsg = if ($PnpEx -and $PnpEx.Message) { $PnpEx.Message } else { $_.Exception.Message }
-        $ExStack = if ($PnpEx -and $PnpEx.Stacktrace) { $PnpEx.Stacktrace } else { $_.ScriptStackTrace }
-        Write-CloneLog -Level Error -Operation "Template" -Object $TargetSiteUrl `
-            -Message "Invoke-PnPSiteTemplate failed: $ExMsg`nStacktrace:`n$ExStack" -ErrorRecord $_
-        throw
+        if ($_.Exception.Message -match '^A duplicate content type "[^"]+" was found\.?\s*$') {
+            Write-CloneLog -Level Warning -Operation "Template" -Object $TargetSiteUrl `
+                -Message "Template provisioning stopped: $($_.Exception.Message) Continuing with content copying using the existing destination structure. Provisioning may be incomplete; remaining template handlers were not resumed and dependent lists or content may fail to copy." `
+                -ErrorRecord $_
+        }
+        else {
+            $PnpEx = Get-PnPException
+            $ExMsg = if ($PnpEx -and $PnpEx.Message) { $PnpEx.Message } else { $_.Exception.Message }
+            $ExStack = if ($PnpEx -and $PnpEx.Stacktrace) { $PnpEx.Stacktrace } else { $_.ScriptStackTrace }
+            Write-CloneLog -Level Error -Operation "Template" -Object $TargetSiteUrl `
+                -Message "Invoke-PnPSiteTemplate failed: $ExMsg`nStacktrace:`n$ExStack" -ErrorRecord $_
+            throw
+        }
     }
 
-    Write-CloneLog `
-        -Level Information `
-        -Operation "Template" `
-        -Object $TargetSiteUrl `
-        -Message "Destination structure provisioned."
+    if ($TemplateProvisioned) {
+        Write-CloneLog `
+            -Level Information `
+            -Operation "Template" `
+            -Object $TargetSiteUrl `
+            -Message "Destination structure provisioned."
+    }
 
+    #endregion Template Application and Duplicate Content Type Handling
+
+    #region Modern Page Relocation
     # Relocate any modern pages defined in subfolders that were flattened during template preparation
     if ($null -ne $script:SubfolderPagesToRelocate -and $script:SubfolderPagesToRelocate.Count -gt 0) {
         Write-CloneLog `
@@ -1200,6 +1268,9 @@ try {
         }
     }
 
+    #endregion Modern Page Relocation
+
+    #region Source List and Library Content Copying
     # Retrieve source lists/libraries
     $SourceLists = Get-PnPList `
         -Includes Title,Hidden,BaseTemplate,BaseType,RootFolder,ItemCount `
@@ -1267,6 +1338,9 @@ try {
             -TargetConnection $TargetConnection
     }
 
+    #endregion Source List and Library Content Copying
+
+    #region Completion Status
     $CopyErrors = @($script:LogEntries | Where-Object Level -eq "Error").Count
     if ($CopyErrors -gt 0) {
         Write-CloneLog -Level Warning -Operation "Complete" -Object $TargetSiteUrl `
@@ -1276,8 +1350,10 @@ try {
         Write-CloneLog -Level Information -Operation "Complete" -Object $TargetSiteUrl `
             -Message "SharePoint site clone completed."
     }
+    #endregion Completion Status
 }
 catch {
+    #region Fatal Error Diagnostics
     $FatalError = $_
     try {
         $PnPException = Get-PnPException
@@ -1298,8 +1374,10 @@ catch {
         -ErrorRecord $FatalError
 
     throw
+    #endregion Fatal Error Diagnostics
 }
 finally {
+    #region Run Summary and Cleanup
     try {
         $Errors = @($script:LogEntries | Where-Object Level -eq "Error").Count
         $Warnings = @($script:LogEntries | Where-Object Level -eq "Warning").Count
@@ -1326,4 +1404,6 @@ finally {
             $RunTimer.Stop()
         }
     }
+    #endregion Run Summary and Cleanup
 }
+#endregion Main Execution
