@@ -45,10 +45,21 @@
     which defaults to true. Change it in the script to false to clone the site
     header layout. No command-line switch is required or accepted for this setting.
     Modern-page headers, navigation, and other branding handlers are unaffected.
-    A duplicate content type error is logged as a warning and content copying
-    continues. Template provisioning may be incomplete: handlers after the
-    failure are not resumed, and dependent lists or content may fail to copy.
-    Other provisioning errors still stop the run.
+    Before provisioning, an unused legacy Design File content type definition
+    (0x010100A2E0023C4C216242892749CE60EC3D07) is omitted from the normalized
+    package only if its name conflicts with a different destination ID.
+    Referenced definitions and other same-name/different-ID conflicts stop the
+    run for review. Destination content types are never deleted or remapped.
+    Provisioning failures stop the run. Required destination lists and libraries
+    are validated before any content copying starts.
+
+    Custom script is not enabled by this script and is not required for ordinary
+    lists and document libraries. NoScript can cause classic branding assets such
+    as the Style Library to be skipped. If these are required, a SharePoint
+    administrator must review and temporarily allow custom script on the target
+    under the customer's policy; SharePoint normally resets it within 24 hours.
+    Rerunning against a partial destination can duplicate standard list items;
+    use a clean test destination when validating a corrected run.
 
     Each run writes CloneLog.csv, CloneTranscript.txt, and PnPTrace.log to its
     timestamped working folder. Logs include site URLs, object names, and error
@@ -227,11 +238,16 @@ function Write-CloneLog {
 function Repair-PnPPageWebPartJson {
         param(
             [Parameter(Mandatory)]
-            [string]$Path
+            [string]$Path,
+
+            [Parameter(Mandatory)]
+            [AllowEmptyCollection()]
+            [object[]]$DestinationContentTypes
         )
 
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $Updates = @{}
+        $Documents = @{}
         $RepairCount = 0
         $script:SubfolderPagesToRelocate.Clear()
         $MapNames = @(
@@ -256,7 +272,49 @@ function Repair-PnPPageWebPartJson {
                     $Reader.Dispose()
                 }
 
+                $Documents[$Entry.FullName] = $Document
+            }
+
+            foreach ($EntryName in $Documents.Keys) {
+                $Document = $Documents[$EntryName]
                 $Changed = $false
+
+                foreach ($ContentType in @($Document.SelectNodes(
+                    "//*[local-name()='ContentTypes']/*[local-name()='ContentType']"
+                ))) {
+                    $Id = $ContentType.GetAttribute("ID")
+                    $Name = $ContentType.GetAttribute("Name")
+                    if (@($DestinationContentTypes | Where-Object { [string]$_.Id -eq $Id }).Count -gt 0) {
+                        continue
+                    }
+                    $Conflicts = @($DestinationContentTypes | Where-Object { $_.Name -eq $Name })
+                    if ($Conflicts.Count -eq 0) {
+                        continue
+                    }
+
+                    $ConflictIds = ($Conflicts | ForEach-Object { [string]$_.Id }) -join ", "
+                    if ($Name -ne "Design File" -or $Id -ne "0x010100A2E0023C4C216242892749CE60EC3D07") {
+                        throw "Content type '$Name' has template ID '$Id' but destination ID(s) '$ConflictIds'. Resolve this conflict before provisioning."
+                    }
+
+                    # Include descendant IDs and references in other XML parts, not just list bindings.
+                    foreach ($Part in $Documents.Values) {
+                        foreach ($Reference in $Part.SelectNodes("//@* | //text()")) {
+                            if ([object]::ReferenceEquals($Reference, $ContentType.GetAttributeNode("ID"))) {
+                                continue
+                            }
+                            if ($Reference.Value.IndexOf($Id, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                                $Reference.Value -match '\{contenttypeid:\s*Design File\s*\}') {
+                                throw "Conflicting content type '$Name' ($Id; destination: $ConflictIds) is referenced in the package. Resolve its dependencies before provisioning."
+                            }
+                        }
+                    }
+
+                    $null = $ContentType.ParentNode.RemoveChild($ContentType)
+                    $Changed = $true
+                    Write-CloneLog -Level Warning -Operation "Template repair" -Object $Name `
+                        -Message "Omitted unused legacy content type '$Id'; destination already has '$Name' with ID(s) '$ConflictIds'. No destination content type was changed."
+                }
 
                 # Normalize modern pages defined in subfolders (e.g. folder1/Folder2/Page.aspx).
                 # PnP Framework has a Windows-specific bug in ObjectClientSidePages.DeterminePageName
@@ -283,7 +341,7 @@ function Repair-PnPPageWebPartJson {
 
                 foreach ($Control in $Document.SelectNodes("//*[@JsonControlData]")) {
                     $Page = $Control.SelectSingleNode("ancestor::*[local-name()='ClientSidePage'][1]")
-                    $ObjectName = "$($Entry.FullName)/$($Control.GetAttribute('ControlId'))"
+                    $ObjectName = "$EntryName/$($Control.GetAttribute('ControlId'))"
                     if ($null -ne $Page) {
                         $ObjectName = "$($Page.GetAttribute('PageName'))/$($Control.GetAttribute('ControlId'))"
                     }
@@ -338,7 +396,7 @@ function Repair-PnPPageWebPartJson {
                 }
 
                 if ($Changed) {
-                    $Updates[$Entry.FullName] = $Document
+                    $Updates[$EntryName] = $Document
                 }
             }
         }
@@ -348,7 +406,7 @@ function Repair-PnPPageWebPartJson {
 
         if ($Updates.Count -eq 0) {
             Write-CloneLog -Level Information -Operation "Template validation" -Object $Path `
-                -Message "No template repairs required (no null maps or subfolder pages)."
+                -Message "No template repairs required (no content-type conflicts, null maps, or subfolder pages)."
             return $Path
         }
 
@@ -378,7 +436,7 @@ function Repair-PnPPageWebPartJson {
         }
 
         Write-CloneLog -Level Information -Operation "Template repair" -Object $NormalizedPath `
-            -Message "Repaired $RepairCount null map(s) and flattened $($script:SubfolderPagesToRelocate.Count) subfolder page(s). Original package preserved at '$Path'."
+            -Message "Saved normalized package including content-type repairs, $RepairCount null-map repair(s), and $($script:SubfolderPagesToRelocate.Count) flattened subfolder page(s). Original package preserved at '$Path'."
         return $NormalizedPath
 }
     #endregion Template Validation and Repair
@@ -470,6 +528,82 @@ function Test-IsSystemLibrary {
     return $false
 }
 #endregion System Library Filtering
+
+function Get-CloneSourceLists {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Lists
+    )
+
+    $ExcludedListTemplates = @(110, 111, 112, 113, 114, 117, 140, 150, 544)
+    foreach ($List in $Lists) {
+        if ($List.Hidden -and -not $IncludeHiddenLists) {
+            continue
+        }
+        if ([int]$List.BaseType -eq 1) {
+            if (-not $CopyDocumentLibraries) {
+                continue
+            }
+            if (Test-IsSystemLibrary -List $List) {
+                Write-CloneLog -Level Warning -Operation "Library" -Object $List.Title `
+                    -Message "Skipped system or template-managed library."
+                continue
+            }
+        }
+        else {
+            if (-not $CopyListItems) {
+                continue
+            }
+            if ($ExcludedListTemplates -contains [int]$List.BaseTemplate) {
+                Write-CloneLog -Level Warning -Operation "List" -Object $List.Title `
+                    -Message "Skipped system list template."
+                continue
+            }
+        }
+        $List
+    }
+}
+
+function Assert-CloneDestinationLists {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$SourceLists,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$TargetLists,
+
+        [Parameter(Mandatory)]
+        [string]$SourceWebServerRelativeUrl,
+
+        [Parameter(Mandatory)]
+        [string]$TargetWebServerRelativeUrl
+    )
+
+    $Failures = 0
+    foreach ($List in $SourceLists) {
+        $RelativePath = Get-SiteRelativePath -ServerRelativeUrl $List.RootFolder.ServerRelativeUrl `
+            -WebServerRelativeUrl $SourceWebServerRelativeUrl
+        $ExpectedPath = "$($TargetWebServerRelativeUrl.TrimEnd('/'))/$RelativePath"
+        $Matches = @($TargetLists | Where-Object {
+            [uri]::UnescapeDataString($_.RootFolder.ServerRelativeUrl).TrimEnd("/") -eq
+                [uri]::UnescapeDataString($ExpectedPath).TrimEnd("/")
+        })
+        if ($Matches.Count -ne 1 -or $Matches[0].Title -ne $List.Title -or
+            [int]$Matches[0].BaseTemplate -ne [int]$List.BaseTemplate) {
+            $Failures++
+            Write-CloneLog -Level Error -Operation "Structure validation" -Object $List.Title `
+                -Message "Expected destination list at '$ExpectedPath' with title '$($List.Title)' and template '$($List.BaseTemplate)' is missing or incompatible. Content copying has not started."
+        }
+    }
+    if ($Failures -gt 0) {
+        throw "Destination structure validation failed for $Failures list(s) or library/libraries. Review the log before retrying."
+    }
+    Write-CloneLog -Level Information -Operation "Structure validation" `
+        -Message "Validated all $($SourceLists.Count) in-scope destination lists and libraries."
+}
 
 #region Destination Folder Creation
 #------------------------------------------------------------
@@ -1175,11 +1309,13 @@ try {
         -Object $TemplatePath `
         -Message "Source structure extracted."
 
-    $ProvisioningTemplatePath = Repair-PnPPageWebPartJson -Path $TemplatePath
+    $DestinationContentTypes = @(Get-PnPContentType -Connection $TargetConnection -ErrorAction Stop)
+    $ProvisioningTemplatePath = Repair-PnPPageWebPartJson -Path $TemplatePath `
+        -DestinationContentTypes $DestinationContentTypes
 
     #endregion Template Export and Repair
 
-    #region Template Application and Duplicate Content Type Handling
+    #region Template Application
     # Apply provisioning package
     Write-CloneLog `
         -Level Information `
@@ -1205,19 +1341,10 @@ try {
         $TemplateProvisioned = $true
     }
     catch {
-        if ($_.Exception.Message -match '^A duplicate content type "[^"]+" was found\.?\s*$') {
-            Write-CloneLog -Level Warning -Operation "Template" -Object $TargetSiteUrl `
-                -Message "Template provisioning stopped: $($_.Exception.Message) Continuing with content copying using the existing destination structure. Provisioning may be incomplete; remaining template handlers were not resumed and dependent lists or content may fail to copy." `
-                -ErrorRecord $_
-        }
-        else {
-            $PnpEx = Get-PnPException
-            $ExMsg = if ($PnpEx -and $PnpEx.Message) { $PnpEx.Message } else { $_.Exception.Message }
-            $ExStack = if ($PnpEx -and $PnpEx.Stacktrace) { $PnpEx.Stacktrace } else { $_.ScriptStackTrace }
-            Write-CloneLog -Level Error -Operation "Template" -Object $TargetSiteUrl `
-                -Message "Invoke-PnPSiteTemplate failed: $ExMsg`nStacktrace:`n$ExStack" -ErrorRecord $_
-            throw
-        }
+        Write-CloneLog -Level Error -Operation "Template" -Object $TargetSiteUrl `
+            -Message "Destination provisioning failed. Content copying will not start. $($_.Exception.Message)" `
+            -ErrorRecord $_
+        throw
     }
 
     if ($TemplateProvisioned) {
@@ -1228,7 +1355,17 @@ try {
             -Message "Destination structure provisioned."
     }
 
-    #endregion Template Application and Duplicate Content Type Handling
+    #endregion Template Application
+
+    $SourceLists = @(Get-PnPList `
+        -Includes Title,Hidden,BaseTemplate,BaseType,RootFolder,ItemCount `
+        -Connection $SourceConnection -ErrorAction Stop)
+    $SourceLists = @(Get-CloneSourceLists -Lists $SourceLists)
+    $TargetLists = @(Get-PnPList -Includes Title,BaseTemplate,RootFolder `
+        -Connection $TargetConnection -ErrorAction Stop)
+    Assert-CloneDestinationLists -SourceLists $SourceLists -TargetLists $TargetLists `
+        -SourceWebServerRelativeUrl $SourceWeb.ServerRelativeUrl `
+        -TargetWebServerRelativeUrl $TargetWeb.ServerRelativeUrl
 
     #region Modern Page Relocation
     # Relocate any modern pages defined in subfolders that were flattened during template preparation
@@ -1271,31 +1408,9 @@ try {
     #endregion Modern Page Relocation
 
     #region Source List and Library Content Copying
-    # Retrieve source lists/libraries
-    $SourceLists = Get-PnPList `
-        -Includes Title,Hidden,BaseTemplate,BaseType,RootFolder,ItemCount `
-        -Connection $SourceConnection
-
     foreach ($SourceList in $SourceLists) {
-        if ($SourceList.Hidden -and -not $IncludeHiddenLists) {
-            continue
-        }
-
         # Document libraries use BaseType 1
         if ([int]$SourceList.BaseType -eq 1) {
-            if (-not $CopyDocumentLibraries) {
-                continue
-            }
-
-            if (Test-IsSystemLibrary -List $SourceList) {
-                Write-CloneLog `
-                    -Level Warning `
-                    -Operation "Library" `
-                    -Object $SourceList.Title `
-                    -Message "Skipped system or template-managed library."
-                continue
-            }
-
             Copy-DocumentLibraryContent `
                 -SourceList $SourceList `
                 -SourceWebServerRelativeUrl $SourceWeb.ServerRelativeUrl `
@@ -1303,32 +1418,6 @@ try {
                 -SourceConnection $SourceConnection `
                 -TargetConnection $TargetConnection
 
-            continue
-        }
-
-        if (-not $CopyListItems) {
-            continue
-        }
-
-        # Skip standard system galleries and workflow/history lists
-        $ExcludedListTemplates = @(
-            110, # Data Sources
-            111, # Site Template Gallery
-            112, # User Information
-            113, # Web Part Gallery
-            114, # List Template Gallery
-            117, # No-code workflows
-            140, # Workflow History
-            150, # Gantt Tasks
-            544  # Microfeed
-        )
-
-        if ($ExcludedListTemplates -contains [int]$SourceList.BaseTemplate) {
-            Write-CloneLog `
-                -Level Warning `
-                -Operation "List" `
-                -Object $SourceList.Title `
-                -Message "Skipped system list template."
             continue
         }
 
