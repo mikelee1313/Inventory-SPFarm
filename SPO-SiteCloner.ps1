@@ -30,6 +30,11 @@
     copied without a limit. Existing destination content is not removed.
     Does not limit template-managed pages or branding assets.
     CopyListItems must still be enabled to copy non-document list items.
+    Source content is read in bounded ranges of the indexed ID column, with
+    file/folder filtering performed locally to avoid broad FSObjType queries
+    on large libraries. Paging alone does not bypass the list-view threshold.
+    Items created above the highest ID observed at the start of each scan are
+    deferred to a later run; this is not a transactional snapshot.
 
 .EXAMPLE
 
@@ -842,6 +847,79 @@ function Convert-ListItemValues {
 # Copy regular SharePoint list items
 #------------------------------------------------------------
 
+function Get-SourceItemsById {
+    param(
+        [Parameter(Mandatory)]
+        $SourceList,
+
+        [Parameter(Mandatory)]
+        $SourceConnection,
+
+        [switch]$FoldersOnly,
+
+        [ValidateRange(1, [int]::MaxValue)]
+        [int]$Limit = [int]::MaxValue
+    )
+
+    $LastItemQuery = @"
+<View Scope='RecursiveAll'>
+  <Query><OrderBy><FieldRef Name='ID' Ascending='FALSE'/></OrderBy></Query>
+  <ViewFields><FieldRef Name='ID'/></ViewFields>
+  <RowLimit Paged='TRUE'>1</RowLimit>
+</View>
+"@
+    $LastItem = @(Get-PnPListItem -List $SourceList.Title -Query $LastItemQuery -PageSize 1 `
+        -Connection $SourceConnection -ErrorAction Stop | Select-Object -First 1)
+    if ($LastItem.Count -eq 0) {
+        return
+    }
+
+    $HighestId = [long]$LastItem[0].Id
+    $Selected = 0
+    $ViewFields = if ($FoldersOnly) {
+        "<ViewFields><FieldRef Name='ID'/><FieldRef Name='FSObjType'/><FieldRef Name='FileRef'/></ViewFields>"
+    }
+    else {
+        ""
+    }
+
+    # ID is unique and indexed: each range can contain at most 2,000 rows,
+    # including folders. RowLimit alone does not bound rows examined by SharePoint.
+    for ([long]$LowerId = 0; $LowerId -lt $HighestId; $LowerId += 2000) {
+        $UpperId = [math]::Min($LowerId + 2000, $HighestId)
+    $Query = @"
+<View Scope='RecursiveAll'>
+  <Query>
+    <Where><And>
+      <Gt><FieldRef Name='ID'/><Value Type='Counter'>$LowerId</Value></Gt>
+      <Leq><FieldRef Name='ID'/><Value Type='Counter'>$UpperId</Value></Leq>
+    </And></Where>
+    <OrderBy><FieldRef Name='ID' Ascending='TRUE'/></OrderBy>
+  </Query>
+  $ViewFields
+  <RowLimit Paged='TRUE'>500</RowLimit>
+</View>
+"@
+        $Batch = @(Get-PnPListItem -List $SourceList.Title -Query $Query -PageSize 500 `
+            -Connection $SourceConnection -ErrorAction Stop)
+        foreach ($Item in $Batch) {
+            if (-not $Item.FieldValues.ContainsKey("FSObjType") -or
+                $null -eq $Item.FieldValues["FSObjType"]) {
+                throw "Source item '$($SourceList.Title)/$($Item.Id)' has no FSObjType; cannot safely select files or folders."
+            }
+            $IsFolder = [int]$Item.FieldValues["FSObjType"] -eq 1
+            if ($IsFolder -ne [bool]$FoldersOnly) {
+                continue
+            }
+            $Item
+            $Selected++
+            if ($Selected -ge $Limit) {
+                return
+            }
+        }
+    }
+}
+
 function Get-LimitedSourceItems {
     param(
         [Parameter(Mandatory)]
@@ -851,21 +929,8 @@ function Get-LimitedSourceItems {
         $SourceConnection
     )
 
-    $PageSize = [math]::Min(500, $MaxItemsPerList)
-    $Query = @"
-<View Scope='RecursiveAll'>
-  <Query>
-    <Where><Eq><FieldRef Name='FSObjType'/><Value Type='Integer'>0</Value></Eq></Where>
-    <OrderBy><FieldRef Name='ID' Ascending='TRUE'/></OrderBy>
-  </Query>
-  <RowLimit Paged='TRUE'>$PageSize</RowLimit>
-</View>
-"@
-
-    # RowLimit controls page size, not the total returned by PnP's paging loop.
-    Get-PnPListItem -List $SourceList.Title -Query $Query -PageSize $PageSize `
-        -Connection $SourceConnection |
-        Select-Object -First $MaxItemsPerList
+    Get-SourceItemsById -SourceList $SourceList -SourceConnection $SourceConnection `
+        -Limit $MaxItemsPerList
 }
     #endregion Limited Source Item Selection
 
@@ -1019,19 +1084,10 @@ function Copy-DocumentLibraryContent {
         $TargetLibraryRoot = $TargetList.RootFolder.ServerRelativeUrl
 
         #region Library Folder Creation
-        $FolderQuery = @"
-<View Scope='RecursiveAll'>
-  <Query>
-    <Where><Eq><FieldRef Name='FSObjType'/><Value Type='Integer'>1</Value></Eq></Where>
-  </Query>
-  <ViewFields><FieldRef Name='FileRef'/></ViewFields>
-</View>
-"@
-        $FolderItems = Get-PnPListItem `
-            -List $SourceList.Title `
-            -PageSize 500 `
-            -Query $FolderQuery `
-            -Connection $SourceConnection
+        Write-CloneLog -Level Information -Operation "Library" -Object $SourceList.Title `
+            -Message "Enumerating folders using bounded indexed-ID ranges."
+        $FolderItems = @(Get-SourceItemsById -SourceList $SourceList `
+            -SourceConnection $SourceConnection -FoldersOnly)
 
         # Create folders first
         $Folders = $FolderItems |
