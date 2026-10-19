@@ -22,6 +22,9 @@
     12. Renames the CSV at completion using the completion date and time.
 
 .NOTES
+    Authors: David O'Saben | Mike Lee
+    Udpated: 10/14/26
+    
     Important:
 
     Get-ReviewItems must not be called with -ErrorAction Stop in this
