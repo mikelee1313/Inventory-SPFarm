@@ -20,8 +20,15 @@
     orphan. Invalid GUIDs, non-Microsoft 365 groups, and failed lookups are
     reported for review and never treated as proof of deletion.
 
-    Outputs timestamped OrphanedGroupSites.csv, GroupSiteAudit.csv, and a log.
-    The audit includes every candidate and sites with invalid/missing properties.
+    Outputs one timestamped GroupSiteFindings.csv and a diagnostic log.
+    Healthy group-connected sites are not exported. Status distinguishes orphan
+    candidates from inconsistent links, invalid/missing properties, and failed lookups.
+    The CSV includes InformationBarrierMode and InformationBarrierSegments,
+    with multiple values joined by commas and no assigned segments shown as None.
+    Group display-name columns are omitted because missing groups have no names.
+    Information barrier properties are explicitly loaded
+    from tenant site properties only for orphan/review sites. Unavailable values
+    are marked and logged, never silently reported as empty.
     Lookup failures produce reports but also a terminating error so an incomplete
     scan cannot be mistaken for a successful scan with no orphans.
 
@@ -234,23 +241,49 @@ function Get-SiteGroupAssessment {
         Template = $Site.Template
         'Group ID' = $Site.GroupId
         RelatedGroupId = $Site.RelatedGroupId
+        InformationBarrierMode = $Site.InformationBarrierMode -join ','
+        InformationBarrierSegments = $Site.InformationBarrierSegments -join ','
         Status = $status
         GroupIdStatus = $links.GroupId.State
-        GroupDisplayName = $links.GroupId.DisplayName
         RelatedGroupIdStatus = $links.RelatedGroupId.State
-        RelatedGroupDisplayName = $links.RelatedGroupId.DisplayName
         Details = $details -join ' | '
         CheckedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
     }
 }
 #endregion Site group assessment
 
+#region Information barrier report enrichment
+function Set-SiteInformationBarrierInfo {
+    param([Parameter(Mandatory)] $Row)
+
+    try {
+        $properties = $tenantAdmin.GetSitePropertiesByUrl([string]$Row.URL, $true)
+        Get-PnPProperty -ClientObject $properties -Property IBMode, IBSegments `
+            -Connection $connection -ErrorAction Stop | Out-Null
+        if ([string]::IsNullOrWhiteSpace($properties.IBMode)) {
+            throw 'SharePoint returned an empty information barrier mode.'
+        }
+        $Row.InformationBarrierMode = $properties.IBMode
+        $segments = $properties.IBSegments -join ','
+        $Row.InformationBarrierSegments = if ([string]::IsNullOrWhiteSpace($segments)) { 'None' } else { $segments }
+        return $true
+    }
+    catch {
+        $Row.InformationBarrierMode = 'Unavailable'
+        $Row.InformationBarrierSegments = 'Unavailable'
+        $detail = "Information barrier lookup failed: $($_.Exception.Message)"
+        $Row.Details = @($Row.Details, $detail) | Where-Object { $_ } | Join-String -Separator ' | '
+        Write-LogEntry "$($Row.URL) : $detail" 'ERROR'
+        return $false
+    }
+}
+#endregion Information barrier report enrichment
+
 #region Report initialization
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $stamp = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss_fff'
 $prefix = Join-Path $OutputDirectory "GroupSites_${TenantName}_$stamp"
-$orphanPath = "${prefix}_OrphanedGroupSites.csv"
-$auditPath = "${prefix}_GroupSiteAudit.csv"
+$reportPath = "${prefix}_GroupSiteFindings.csv"
 $logPath = "${prefix}.log"
 $connection = $null
 $groupCache = @{}
@@ -266,6 +299,7 @@ try {
     Write-LogEntry "Connecting to $AdminUrl."
     $connection = Connect-PnPOnline -Url $AdminUrl.AbsoluteUri -ClientId $AppId.ToString() `
         -Thumbprint $Thumbprint -Tenant $Tenant -ReturnConnection -ErrorAction Stop
+    $tenantAdmin = [Microsoft.Online.SharePoint.TenantAdministration.Tenant]::new($connection.Context)
 
     # Verify tenant-wide group read access before accepting any 404 as evidence.
     $probe = Invoke-GraphGet 'groups?$top=1&$select=id'
@@ -285,10 +319,10 @@ try {
     # Always write headers, even when no candidates are found.
     $schema = Get-SiteGroupAssessment -Site ([pscustomobject]@{
         Url = ''; Title = ''; Template = ''; GroupId = [guid]::Empty; RelatedGroupId = [guid]::Empty
+        InformationBarrierMode = ''; InformationBarrierSegments = @()
     })
     $header = ($schema | ConvertTo-Csv -NoTypeInformation)[0]
-    Set-Content -LiteralPath $orphanPath -Value $header -Encoding utf8BOM
-    Set-Content -LiteralPath $auditPath -Value $header -Encoding utf8BOM
+    Set-Content -LiteralPath $reportPath -Value $header -Encoding utf8BOM
     #endregion CSV headers
 
     #region Site processing and report export
@@ -300,27 +334,28 @@ try {
         $row = Get-SiteGroupAssessment -Site $site
         if ($row.Status -eq 'NotGroupConnected') { continue }
         $checked++
-        $row | Export-Csv -LiteralPath $auditPath -Append -NoTypeInformation -Encoding utf8BOM
+        if ($row.Status -eq 'GroupFound') { continue }
+        $barrierInfoLoaded = Set-SiteInformationBarrierInfo -Row $row
+        if (-not $barrierInfoLoaded) { $failures++ }
         if ($row.Status -eq 'OrphanedGroupSite') {
             $orphans++
-            $row | Export-Csv -LiteralPath $orphanPath -Append -NoTypeInformation -Encoding utf8BOM
         }
-        elseif ($row.Status -ne 'GroupFound') {
+        if ($row.Status -ne 'OrphanedGroupSite' -or -not $barrierInfoLoaded) {
             $review++
             Write-LogEntry "$($row.URL) : $($row.Status). $($row.Details)" 'WARNING'
             if ($row.Status -in 'LookupFailed', 'InvalidGroupId', 'PropertyUnavailable') { $failures++ }
         }
+        $row | Export-Csv -LiteralPath $reportPath -Append -NoTypeInformation -Encoding utf8BOM
     }
     #endregion Site processing and report export
 
     #region Scan summary
     Write-LogEntry "Scan finished: $checked candidates/review sites; $orphans orphan candidates; $review sites require review; $failures incomplete assessments."
     Write-Host "Checked $checked candidate/review sites. Orphan candidates: $orphans. Review required: $review."
-    Write-Host "Orphan candidates: $orphanPath"
-    Write-Host "Full audit: $auditPath"
+    Write-Host "Findings report: $reportPath"
     Write-Host "Log: $logPath"
     if ($failures -gt 0) {
-        throw "$failures site assessment(s) could not be completed. Review the audit and log; the orphan report is incomplete."
+        throw "$failures lookup/assessment failure(s) occurred. Review the findings report and log; the scan is incomplete."
     }
     #endregion Scan summary
 }
