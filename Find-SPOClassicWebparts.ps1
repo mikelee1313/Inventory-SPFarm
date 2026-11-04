@@ -3,13 +3,16 @@
     Inventories selected classic Web Parts across SharePoint Online sites.
 
 .DESCRIPTION
-    This script scans classic ASPX pages in the Site Pages and Pages libraries of each
-    selected site and all its nested subsites to find and catalog selected Web Parts.
+    This script scans classic ASPX pages in document libraries of each selected site
+    and all its nested subsites to find and catalog selected Web Parts. Libraries are
+    discovered by BaseType (DocumentLibrary), including custom-named, wiki, and
+    publishing libraries, rather than by title.
     It includes comprehensive throttling handling per Microsoft guidance and uses certificate-based
     authentication with an Azure AD App Registration. Results are exported to a CSV file with
     immediate write capability for large datasets.
     Page owner is the Created By user. PageLastModified is the page's Modified timestamp
     in ISO 8601 format, not a last-view or last-access timestamp.
+    Library discovery is filtered on the server to avoid enumerating unrelated restricted lists.
 
 .PARAMETER tenant
     The SharePoint tenant name (without .sharepoint.com suffix).
@@ -27,7 +30,9 @@
 .PARAMETER SiteListPath
     Optional file path containing a list of site URLs to scan (one per line).
     Each URL and its nested subsites are scanned. If empty, scans all tenant site
-    collections and their subsites. Overlapping URLs are scanned only once.
+    collections that match the tenant-site filter and their subsites. Tenant discovery
+    excludes OneDrive, inactive, archived, redirect, and selected system sites.
+    Explicit file URLs bypass that filter. Overlapping URLs are scanned only once.
 
 .PARAMETER classicWebPartTypes
     Array of classic Web Part type names to search for.
@@ -56,7 +61,7 @@
 
 .NOTES
     - Author: Mike Lee
-    - Date: 11/4/26
+    - Date: 11/4/2026
     - Requires PnP PowerShell module
     - Uses certificate-based authentication
     - Implements exponential backoff for throttling
@@ -242,13 +247,17 @@ if ($SiteListPath -and $SiteListPath.Trim() -ne "") {
     }
 }
 else {
-    Write-Host "Retrieving all tenant sites..." -ForegroundColor Cyan
-    $sites = Invoke-WithThrottleHandling -OperationName "Get Tenant Sites" -ScriptBlock {
-        Get-PnPTenantSite
-    }
-    # You may choose to filter sites
-    $filteredSites = $sites #| Where-Object { $_.Url -like '*IT*' }
-    Write-Host "Found $($filteredSites.Count) sites in tenant" -ForegroundColor Green
+    Write-Host "Retrieving active, non-archived tenant sites (excluding OneDrive and selected system sites)..." -ForegroundColor Cyan
+    $filteredSites = @(Invoke-WithThrottleHandling -OperationName "Get Tenant Sites" -ScriptBlock {
+        Get-PnPTenantSite -IncludeOneDriveSites:$false -ErrorAction Stop | Where-Object {
+            $_.Template -notmatch "SRCHCEN|MYSITE|APPCATALOG|PWS|POINTPUBLISHINGTOPIC|SPSMSITEHOST|EHS|REVIEWCTR|TENANTADMIN" -and
+            $_.Status -eq "Active" -and
+            $_.ArchiveStatus -eq "NotArchived" -and
+            $_.Template -notlike "*Redirect*" -and
+            -not [string]::IsNullOrEmpty($_.Url)
+        }
+    })
+    Write-Host "Found $($filteredSites.Count) tenant sites matching the scan filter" -ForegroundColor Green
 }
 
 $siteQueue = [System.Collections.Generic.Queue[object]]::new()
@@ -296,15 +305,32 @@ while ($siteQueue.Count -gt 0) {
             Write-Host "    Unable to discover subsites of $siteUrl`: $($_.Exception.Message). Descendant coverage may be incomplete." -ForegroundColor DarkYellow
         }
         
-        # Classic pages may be stored in either of these libraries
+        # Filter on the server; enumerating unrelated restricted lists can fail with access denied.
         $pageLibraries = Invoke-WithThrottleHandling -OperationName "Get page libraries" -ScriptBlock {
-            Get-PnPList | Where-Object { $_.Title -in @("Site Pages", "Pages") }
+            $libraryUrl = '/_api/web/lists?$select=Id,Title&$filter=BaseType eq 1'
+            $libraries = @(
+                do {
+                    $response = Invoke-PnPSPRestMethod -Url $libraryUrl -Method Get -ErrorAction Stop
+                    $response.value
+                    $libraryUrl = $response.'odata.nextLink'
+                    if (-not $libraryUrl) {
+                        $libraryUrl = $response.'@odata.nextLink'
+                    }
+                } while ($libraryUrl)
+            )
+            $libraries
         }
 
         $siteHasHits = $false
         foreach ($pageLibrary in $pageLibraries) {
-            $pages = Invoke-WithThrottleHandling -OperationName "Get pages from $($pageLibrary.Title)" -ScriptBlock {
-                Get-PnPListItem -List $pageLibrary.Title -Fields "FileLeafRef", "FileRef", "Author", "Modified" -ErrorAction Stop
+            try {
+                $pages = Invoke-WithThrottleHandling -OperationName "Get pages from $($pageLibrary.Title)" -ScriptBlock {
+                    Get-PnPListItem -List $pageLibrary.Id -Fields "FileLeafRef", "FileRef", "Author", "Modified" -PageSize 500 -ErrorAction Stop
+                }
+            }
+            catch {
+                Write-Host "    Unable to read library $($pageLibrary.Title) on $siteUrl`: $($_.Exception.Message). Continuing with other libraries." -ForegroundColor DarkYellow
+                continue
             }
             
             foreach ($pageItem in $pages) {
