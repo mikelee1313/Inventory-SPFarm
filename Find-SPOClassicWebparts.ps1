@@ -13,6 +13,9 @@
     Page owner is the Created By user. PageLastModified is the page's Modified timestamp
     in ISO 8601 format, not a last-view or last-access timestamp.
     Library discovery is filtered on the server to avoid enumerating unrelated restricted lists.
+    Large libraries are read recursively in indexed ID ranges of at most 2,000 items,
+    with ASPX filtering performed locally to avoid filename-query list view thresholds.
+    Each library uses its highest ID at scan start; newly added items may require another run.
 
 .PARAMETER tenant
     The SharePoint tenant name (without .sharepoint.com suffix).
@@ -83,36 +86,41 @@
 # MODIFY THE SETTINGS BELOW TO MATCH YOUR ENVIRONMENT
 # ============================================================
 
-# ----- Tenant & Authentication -----
+#region Tenant & Authentication
 $tenant = "m365cpi13246019"                                    # Tenant name (without .sharepoint.com)
 $appID = "abc64618-283f-47ba-a185-50d935d51d57"              # Azure AD App Registration Client ID
 $thumbprint = "B696FDCFE1453F3FBC6031F54DE988DA0ED905A9"       # Certificate thumbprint
 $tenantid =  "9cfc42cb-51da-4055-87e9-b20a170b6ba3"             # Azure AD Tenant ID
+#endregion
 
-# ----- Site Scope -----
+#region Site Scope
 # Leave empty ("") to scan ALL tenant sites
 # Set to a file path to scan only specific sites (one URL per line in the file)
 $SiteListPath = ""                                              # Example: "./sites.txt"
+#endregion
 
-# ----- Classic Web Parts to Find -----
+#region Classic Web Parts to Find
 # Specify the full type names used in classic Web Part XML
 $classicWebPartTypes = @(
     "Microsoft.SharePoint.WebPartPages.ScriptEditorWebPart"
     "Microsoft.SharePoint.WebPartPages.ContentEditorWebPart"
     "Microsoft.Office.Server.Search.WebControls.ContentBySearchWebPart"
 )
+#endregion
 
-# ----- Output -----
+#region Output Settings
 $outputFolder = "./"                                            # Folder for the results CSV
 $outputPrefix = "WebPartInventory"                              # File name prefix (timestamp will be added)
 # Output file will be: WebPartInventory_yyyyMMdd_HHmmss.csv
+#endregion
 
-# ----- Throttling Settings -----
+#region Throttling Settings
 # Adjust these if you experience throttling issues
 $maxRetries = 5                                                 # Max retries for throttled requests
 $baseDelaySeconds = 2                                           # Base delay for exponential backoff
 $delayBetweenSites = 500                                        # Milliseconds between sites
 $delayBetweenPages = 100                                        # Milliseconds between pages
+#endregion
 
 # ============================================================
 # END OF CONFIGURATION - DO NOT MODIFY BELOW THIS LINE
@@ -121,6 +129,7 @@ $delayBetweenPages = 100                                        # Milliseconds b
 
 #region ==================== FUNCTIONS ====================
 
+#region Throttle Handling
 # Initialize throttle counter
 $script:throttleCount = 0
 
@@ -164,14 +173,34 @@ function Invoke-WithThrottleHandling {
                     throw $_
                 }
                 
-                # Determine wait time: use Retry-After header if available, otherwise exponential backoff
+                # Retry-After can be either a delay in seconds or an HTTP date.
+                $waitSeconds = $null
                 if ($retryAfter) {
-                    $waitSeconds = [int]$retryAfter
+                    $retryAfterValue = [string]$retryAfter
+                    $retryAfterDelay = 0
+                    if ([int]::TryParse($retryAfterValue, [ref]$retryAfterDelay)) {
+                        $waitSeconds = [Math]::Max(0, $retryAfterDelay)
+                    }
+                    else {
+                        $retryAfterDate = [DateTimeOffset]::MinValue
+                        if ([DateTimeOffset]::TryParse(
+                                $retryAfterValue,
+                                [Globalization.CultureInfo]::InvariantCulture,
+                                [Globalization.DateTimeStyles]::AssumeUniversal,
+                                [ref]$retryAfterDate
+                            )) {
+                            $secondsUntilRetry = [Math]::Ceiling(($retryAfterDate - [DateTimeOffset]::UtcNow).TotalSeconds)
+                            $waitSeconds = [int][Math]::Min([int]::MaxValue, [Math]::Max(0, $secondsUntilRetry))
+                        }
+                    }
+                }
+
+                if ($null -ne $waitSeconds) {
                     Write-Host "        Throttled (HTTP $statusCode). Retry-After: $waitSeconds seconds. Attempt $retryCount of $MaxRetries" -ForegroundColor DarkYellow
                 }
                 else {
-                    # Exponential backoff: 2^retryCount * baseDelay (2, 4, 8, 16, 32 seconds...)
-                    $waitSeconds = [math]::Pow(2, $retryCount) * $baseDelaySeconds
+                    # Exponential backoff starts at the configured base delay.
+                    $waitSeconds = [math]::Pow(2, $retryCount - 1) * $baseDelaySeconds
                     Write-Host "        Throttled (HTTP $statusCode). Waiting $waitSeconds seconds (exponential backoff). Attempt $retryCount of $MaxRetries" -ForegroundColor DarkYellow
                 }
                 
@@ -186,7 +215,9 @@ function Invoke-WithThrottleHandling {
     
     return $result
 }
+#endregion
 
+#region Web Part Type Parsing
 function Get-ClassicWebPartTypeName {
     param(
         [Parameter(Mandatory = $true)]
@@ -215,20 +246,27 @@ function Get-ClassicWebPartTypeName {
     return ($typeName -split ',')[0].Trim()
 }
 #endregion
+#endregion
 
 #region ==================== MAIN EXECUTION ====================
 
+#region Output Initialization
 # Generate output file path with timestamp
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $outputPath = Join-Path -Path $outputFolder -ChildPath "${outputPrefix}_${timestamp}.csv"
+$outputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($outputPath)
 
 # Initialize CSV with headers
-"SiteUrl,PageUrl,PageName,WebPartTitle,WebPartId,WebPartType,PageOwner,PageOwnerEmail,PageLastModified" | Out-File -FilePath $outputPath -Encoding UTF8
+"SiteUrl,PageUrl,PageName,WebPartTitle,WebPartId,WebPartType,PageOwner,PageOwnerEmail,PageLastModified" | Out-File -FilePath $outputPath -Encoding UTF8 -ErrorAction Stop
+$csvWriter = [System.IO.StreamWriter]::new($outputPath, $true, [System.Text.UTF8Encoding]::new($false))
+#endregion
 
+try {
+#region Admin Connection and Site Discovery
 # Connect to admin site to get all tenant sites
 Write-Host "Connecting to SharePoint Admin..." -ForegroundColor Cyan
 Invoke-WithThrottleHandling -OperationName "Connect to Admin" -ScriptBlock {
-    Connect-PnPOnline -Url "https://$($script:tenant)-admin.sharepoint.com" -ClientId $script:appID -Thumbprint $script:thumbprint -Tenant $script:tenantid
+    Connect-PnPOnline -Url "https://$($script:tenant)-admin.sharepoint.com" -ClientId $script:appID -Thumbprint $script:thumbprint -Tenant $script:tenantid -ErrorAction Stop
 }
 
 # Get sites: from file if specified, otherwise all tenant sites
@@ -259,7 +297,9 @@ else {
     })
     Write-Host "Found $($filteredSites.Count) tenant sites matching the scan filter" -ForegroundColor Green
 }
+#endregion
 
+#region Site Queue and Scan Statistics
 $siteQueue = [System.Collections.Generic.Queue[object]]::new()
 $knownSiteUrls = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($site in $filteredSites) {
@@ -275,7 +315,9 @@ $sitesWithHits = 0
 $totalPagesScanned = 0
 $totalWebPartsFound = 0
 $startTime = Get-Date
+#endregion
 
+#region Site Scanning
 while ($siteQueue.Count -gt 0) {
     $site = $siteQueue.Dequeue()
     $currentSite++
@@ -305,6 +347,7 @@ while ($siteQueue.Count -gt 0) {
             Write-Host "    Unable to discover subsites of $siteUrl`: $($_.Exception.Message). Descendant coverage may be incomplete." -ForegroundColor DarkYellow
         }
         
+        #region Library and Page Scanning
         # Filter on the server; enumerating unrelated restricted lists can fail with access denied.
         $pageLibraries = Invoke-WithThrottleHandling -OperationName "Get page libraries" -ScriptBlock {
             $libraryUrl = '/_api/web/lists?$select=Id,Title&$filter=BaseType eq 1'
@@ -321,99 +364,153 @@ while ($siteQueue.Count -gt 0) {
             $libraries
         }
 
+        $highestIdQuery = @"
+<View Scope='RecursiveAll'>
+  <ViewFields><FieldRef Name='ID' /></ViewFields>
+  <Query><OrderBy Override='TRUE'><FieldRef Name='ID' Ascending='FALSE' /></OrderBy></Query>
+  <RowLimit>1</RowLimit>
+</View>
+"@
+        $idRangeSize = 2000
         $siteHasHits = $false
         foreach ($pageLibrary in $pageLibraries) {
             try {
-                $pages = Invoke-WithThrottleHandling -OperationName "Get pages from $($pageLibrary.Title)" -ScriptBlock {
-                    Get-PnPListItem -List $pageLibrary.Id -Fields "FileLeafRef", "FileRef", "Author", "Modified" -PageSize 500 -ErrorAction Stop
+                $lastItem = @(Invoke-WithThrottleHandling -OperationName "Get highest item ID from $($pageLibrary.Title)" -ScriptBlock {
+                    Get-PnPListItem -List $pageLibrary.Id -Query $highestIdQuery -ErrorAction Stop
+                })
+                if ($lastItem.Count -eq 0) {
+                    continue
                 }
+                $highestItemId = [long]$lastItem[0].Id
             }
             catch {
                 Write-Host "    Unable to read library $($pageLibrary.Title) on $siteUrl`: $($_.Exception.Message). Continuing with other libraries." -ForegroundColor DarkYellow
                 continue
             }
             
-            foreach ($pageItem in $pages) {
-                $pageName = $pageItem.FieldValues["FileLeafRef"]
-                
-                # Skip non-aspx files
-                if ($pageName -notlike "*.aspx") { continue }
-
-                $pageAuthor = $pageItem.FieldValues["Author"]
-                $pageModified = $pageItem.FieldValues["Modified"]
-                $pageLastModified = ""
-                if ($null -ne $pageModified) {
-                    $pageLastModified = ([datetime]$pageModified).ToString("o")
-                }
-                if ($null -eq $pageAuthor -or $null -eq $pageModified) {
-                    Write-Host "    Missing Created By or Modified metadata on $($pageItem.FieldValues['FileRef']); unavailable values will be blank in the CSV." -ForegroundColor DarkYellow
-                }
-                
-                $totalPagesScanned++
-                
-                # Add small delay between pages to avoid request spikes
-                Start-Sleep -Milliseconds $delayBetweenPages
-                
+            # ID is indexed; each numeric range can contain at most 2,000 items, including folders.
+            for ($firstId = 1L; $firstId -le $highestItemId; $firstId += $idRangeSize) {
+                $lastId = [Math]::Min($firstId + $idRangeSize - 1, $highestItemId)
+                $pageQuery = @"
+<View Scope='RecursiveAll'>
+  <ViewFields>
+    <FieldRef Name='ID' />
+    <FieldRef Name='FileLeafRef' />
+    <FieldRef Name='FileRef' />
+    <FieldRef Name='Author' />
+    <FieldRef Name='Modified' />
+  </ViewFields>
+  <Query>
+    <Where>
+      <And>
+        <Geq><FieldRef Name='ID' /><Value Type='Counter'>$firstId</Value></Geq>
+        <Leq><FieldRef Name='ID' /><Value Type='Counter'>$lastId</Value></Leq>
+      </And>
+    </Where>
+    <OrderBy Override='TRUE'><FieldRef Name='ID' Ascending='TRUE' /></OrderBy>
+  </Query>
+  <RowLimit Paged='TRUE'>500</RowLimit>
+</View>
+"@
                 try {
-                    # Retrieve classic web part definitions and their XML type names
-                    $currentPageName = $pageName
-                    $pageServerRelativeUrl = $pageItem.FieldValues["FileRef"]
-                    $webParts = Invoke-WithThrottleHandling -OperationName "Get classic web parts from $currentPageName" -ScriptBlock {
-                        Get-PnPWebPart -ServerRelativePageUrl $pageServerRelativeUrl -ErrorAction Stop
+                    $pages = Invoke-WithThrottleHandling -OperationName "Get item IDs $firstId-$lastId from $($pageLibrary.Title)" -ScriptBlock {
+                        Get-PnPListItem -List $pageLibrary.Id -PageSize 500 -Query $pageQuery -ErrorAction Stop
                     }
                 }
                 catch {
-                    Write-Host "    Unable to inspect classic web parts on $pageName`: $($_.Exception.Message)" -ForegroundColor DarkYellow
+                    Write-Host "    Unable to read item IDs $firstId-$lastId from library $($pageLibrary.Title) on $siteUrl`: $($_.Exception.Message). Coverage is incomplete; continuing with other ranges." -ForegroundColor DarkYellow
                     continue
                 }
 
-                foreach ($webPart in $webParts) {
+                foreach ($pageItem in $pages) {
+                    $pageName = $pageItem.FieldValues["FileLeafRef"]
+                
+                    # Skip non-aspx files
+                    if ($pageName -notlike "*.aspx") { continue }
+
+                    $pageAuthor = $pageItem.FieldValues["Author"]
+                    $pageModified = $pageItem.FieldValues["Modified"]
+                    $pageLastModified = ""
+                    if ($null -ne $pageModified) {
+                        $pageLastModified = ([datetime]$pageModified).ToString("o")
+                    }
+                    if ($null -eq $pageAuthor -or $null -eq $pageModified) {
+                        Write-Host "    Missing Created By or Modified metadata on $($pageItem.FieldValues['FileRef']); unavailable values will be blank in the CSV." -ForegroundColor DarkYellow
+                    }
+                
+                    $totalPagesScanned++
+                
+                    # Add small delay between pages to avoid request spikes
+                    Start-Sleep -Milliseconds $delayBetweenPages
+                
+                    #region Web Part Inspection and Export
                     try {
-                        $webPartXml = Invoke-WithThrottleHandling -OperationName "Get web part XML from $currentPageName" -ScriptBlock {
-                            Get-PnPWebPartXml -ServerRelativePageUrl $pageServerRelativeUrl -Identity $webPart.Id -ErrorAction Stop
+                        # Retrieve classic web part definitions and their XML type names
+                        $currentPageName = $pageName
+                        $pageServerRelativeUrl = $pageItem.FieldValues["FileRef"]
+                        $webParts = Invoke-WithThrottleHandling -OperationName "Get classic web parts from $currentPageName" -ScriptBlock {
+                            Get-PnPWebPart -ServerRelativePageUrl $pageServerRelativeUrl -ErrorAction Stop
                         }
-                        $webPartType = Get-ClassicWebPartTypeName -WebPartXml $webPartXml
                     }
                     catch {
-                        Write-Host "    Unable to inspect web part $($webPart.Id) on $pageName`: $($_.Exception.Message)" -ForegroundColor DarkYellow
+                        Write-Host "    Unable to inspect classic web parts on $pageName`: $($_.Exception.Message)" -ForegroundColor DarkYellow
                         continue
                     }
 
-                    if ($webPartType -and $classicWebPartTypes -contains $webPartType) {
-                        if (-not $siteHasHits) {
-                            $sitesWithHits++
-                            $siteHasHits = $true
+                    foreach ($webPart in $webParts) {
+                        try {
+                            $webPartXml = Invoke-WithThrottleHandling -OperationName "Get web part XML from $currentPageName" -ScriptBlock {
+                                Get-PnPWebPartXml -ServerRelativePageUrl $pageServerRelativeUrl -Identity $webPart.Id -ErrorAction Stop
+                            }
+                            $webPartType = Get-ClassicWebPartTypeName -WebPartXml $webPartXml
                         }
-                        $totalWebPartsFound++
+                        catch {
+                            Write-Host "    Unable to inspect web part $($webPart.Id) on $pageName`: $($_.Exception.Message)" -ForegroundColor DarkYellow
+                            continue
+                        }
+
+                        if ($webPartType -and $classicWebPartTypes -contains $webPartType) {
+                            if (-not $siteHasHits) {
+                                $sitesWithHits++
+                                $siteHasHits = $true
+                            }
+                            $totalWebPartsFound++
                         
-                        $pageUrl = ([uri]::new([uri]$site.Url, $pageServerRelativeUrl)).AbsoluteUri
-                        Write-Host "    FOUND: $webPartType ($($webPart.WebPart.Title)) on $pageName" -ForegroundColor Green
+                            $pageUrl = ([uri]::new([uri]$site.Url, $pageServerRelativeUrl)).AbsoluteUri
+                            Write-Host "    FOUND: $webPartType ($($webPart.WebPart.Title)) on $pageName" -ForegroundColor Green
                         
-                        # Write to CSV immediately
-                        [PSCustomObject]@{
-                            SiteUrl          = $site.Url
-                            PageUrl          = $pageUrl
-                            PageName         = $pageName
-                            WebPartTitle     = $webPart.WebPart.Title
-                            WebPartId        = $webPart.Id
-                            WebPartType      = $webPartType
-                            PageOwner        = $pageAuthor.LookupValue
-                            PageOwnerEmail   = $pageAuthor.Email
-                            PageLastModified = $pageLastModified
-                        } | Export-Csv -Path $outputPath -Append -NoTypeInformation
+                            $csvRow = [PSCustomObject]@{
+                                SiteUrl          = $site.Url
+                                PageUrl          = $pageUrl
+                                PageName         = $pageName
+                                WebPartTitle     = $webPart.WebPart.Title
+                                WebPartId        = $webPart.Id
+                                WebPartType      = $webPartType
+                                PageOwner        = $pageAuthor.LookupValue
+                                PageOwnerEmail   = $pageAuthor.Email
+                                PageLastModified = $pageLastModified
+                            }
+                            $csvLines = @($csvRow | ConvertTo-Csv -NoTypeInformation)
+                            $csvWriter.WriteLine($csvLines[1])
+                            $csvWriter.Flush()
+                        }
                     }
+                    #endregion
                 }
             }
         }
+        #endregion
     }
     catch {
         Write-Host "    Error accessing site: $($_.Exception.Message)" -ForegroundColor Red
     }
-    
+
     # Add delay between sites to avoid request spikes
     Start-Sleep -Milliseconds $delayBetweenSites
 }
+#endregion
 
+#region Scan Summary
 $endTime = Get-Date
 $duration = $endTime - $startTime
 
@@ -427,4 +524,9 @@ Write-Host "Throttle events:        $($script:throttleCount)" -ForegroundColor $
 Write-Host "Duration:               $($duration.ToString('hh\:mm\:ss'))" -ForegroundColor White
 Write-Host "===================================" -ForegroundColor Cyan
 Write-Host "Results exported to: $outputPath" -ForegroundColor Green
+#endregion
+}
+finally {
+    $csvWriter.Dispose()
+}
 #endregion
