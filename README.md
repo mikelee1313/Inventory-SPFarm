@@ -24,10 +24,7 @@ The scripts are grouped below by platform so you can easily distinguish SharePoi
 | [SharePoint_Farm_Inventory_Report.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/SharePoint_Farm_Inventory_Report.ps1) | Scans the SharePoint farm and collects detailed inventory information. |
 | [SharePoint_Farm_Inventory_Report_WithMembers.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/SharePoint_Farm_Inventory_Report_WithMembers.ps1) | Generates a farm inventory report that also includes membership information. |
 | [EmailLibrariesReport.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/EmailLibrariesReport.ps1) | Identifies document libraries configured for incoming email and exports key details. |
-| [Get-AllDocLibrariesReport.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Get-AllDocLibrariesReport.ps1) | Exports an inventory of document libraries across the SharePoint environment. |
-| [Get-EventReceivers.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Get-EventReceivers.ps1) | Lists SharePoint event receivers configured on sites, lists, or libraries. |
 | [Get-PreservationHoldLibraryReport.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Get-PreservationHoldLibraryReport.ps1) | Reports on preservation hold libraries and related disposition details. |
-| [Export-SPOnPremLibrary.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Export-SPOnPremLibrary.ps1) | Exports an on-premises SharePoint document library to a local directory structure or CSV. |
 | [Scan-SharePoint2010Workflows.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Scan-SharePoint2010Workflows.ps1) | Scans web applications for SharePoint 2010 workflow details and produces a report. |
 | [Export-InfoPathAttachments.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Export-InfoPathAttachments.ps1) | Exports InfoPath form attachments from SharePoint content for archival or migration. |
 
@@ -37,6 +34,9 @@ The scripts are grouped below by platform so you can easily distinguish SharePoi
 |---|---|
 | [Get-SPOSiteInventory.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Get-SPOSiteInventory.ps1) | Creates an inventory of SharePoint Online sites and related site metadata. |
 | [SPO-Document-Inventory-Report.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/SPO-Document-Inventory-Report.ps1) | Produces a document inventory report for SharePoint Online libraries. |
+| [Export-SPOnPremLibrary.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Export-SPOnPremLibrary.ps1) | Exports a SharePoint document library to a local directory structure or CSV and is used for SharePoint Online content management scenarios. |
+| [Get-EventReceivers.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Get-EventReceivers.ps1) | Lists event receivers configured across SharePoint Online sites, lists, or libraries. |
+| [Get-AllDocLibrariesReport.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Get-AllDocLibrariesReport.ps1) | Exports a broad inventory of document libraries across the SharePoint Online environment. |
 | [Find-StaleSPOFiles.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Find-StaleSPOFiles.ps1) | Identifies stale SharePoint Online files based on last-modified activity and age thresholds. |
 | [Find-StaleSPOFiles-Graph.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Find-StaleSPOFiles-Graph.ps1) | Uses Microsoft Graph to detect stale SharePoint Online files and produce a report. |
 | [Find-SPOClassicWebparts.ps1](https://github.com/mikelee1313/Inventory-SPFarm/blob/main/Find-SPOClassicWebparts.ps1) | Scans SharePoint Online pages or sites for classic web parts. |
